@@ -20,4 +20,5 @@ The full list of modules described in this chapter is:
    importlib.resources.rst
    importlib.resources.abc.rst
    importlib.metadata.rst
+   importlib.version.rst
    sys_path_init.rst

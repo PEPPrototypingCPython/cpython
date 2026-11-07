@@ -368,7 +368,8 @@ COVERAGE_REPORT_OPTIONS=--rc lcov_branch_coverage=1 --branch-coverage --title "C
 # Modules
 MODULE_OBJS_COMMON=	\
 		Modules/main.o \
-		Modules/gcmodule.o
+		Modules/gcmodule.o \
+		Modules/_versionmodule.o
 
 MODULE_OBJS=	\
 		Modules/config.o \

@@ -30,6 +30,7 @@ generically as an :term:`importer`) to participate in the import process.
 Three, the package contains modules exposing additional functionality for
 managing aspects of Python packages:
 
+* :mod:`importlib.version` parses, normalizes and compares distribution versions.
 * :mod:`importlib.metadata` presents access to metadata from third-party
   distributions.
 * :mod:`importlib.resources` provides routines for accessing non-code

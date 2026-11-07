@@ -48,6 +48,7 @@ SRC_DIR = pathlib.Path(__file__).parent.parent.parent
 
 # core modules, hard-coded in Modules/config.h.in
 CORE_MODULES = {
+    "importlib.version",
     "_ast",
     "_imp",
     "_string",
