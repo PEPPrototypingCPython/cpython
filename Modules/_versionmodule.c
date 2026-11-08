@@ -31,13 +31,13 @@
  *
  * The compact order key uses 118 bits: release(64), pre(20), post(17), dev(17).
  *
- *   high: 63          54 53                                      0
- *         +-------------+----------------------------------------+
- *         | zero (10)   | release[63:10] (54)                     |
- *         +-------------+----------------------------------------+
+ *   high: 63                                                     0
+ *         +-------------------------------------------------------+
+ *         | release (64)                                          |
+ *         +-------------------------------------------------------+
  *   low:  63          54 53             34 33        17 16        0
  *         +-------------+----------------+------------+-----------+
- *         | release[9:0]| pre (20)       | post (17)  | dev (17)  |
+ *         | zero (10)   | pre (20)       | post (17)  | dev (17)  |
  *         +-------------+----------------+------------+-----------+
  *
  * The four 16-bit release fields are zero-padded, so 1 and 1.0 compare equal.
@@ -357,7 +357,7 @@ small_dev(const VersionObject *version)
 static inline uint64_t
 small_release(const VersionObject *version)
 {
-    return (version->value.key.high << 10) | (version->value.key.low >> 54);
+    return version->value.key.high;
 }
 
 static VersionKey
@@ -381,8 +381,8 @@ pack_small_key(const SmallParts *parts)
     uint32_t dev = (parts->flags & 2) ? parts->dev_n : 0x1ffff;
     /* Two uint64_t words avoid a compiler-specific 128-bit integer type. */
     return (VersionKey){
-        .high = release >> 10,
-        .low = (release << 54) | ((uint64_t)pre << 34) |
+        .high = release,
+        .low = ((uint64_t)pre << 34) |
                ((uint64_t)post << 17) | dev,
     };
 }
