@@ -26,8 +26,8 @@
  *
  * Compact values have epoch zero, no local label, one to four release
  * components, and unsigned 16-bit component numbers.  Larger values use full
- * storage.  from_parts also keeps integer and release-tuple subclasses in
- * full storage to preserve their state and behavior.
+ * storage.  from_parts also keeps integer subclasses in full storage to
+ * preserve their state and behavior.
  *
  * The compact order key uses 118 bits: release(64), pre(20), post(17), dev(17).
  *
@@ -1663,36 +1663,66 @@ get_micro_impl(PyObject *self, void *Py_UNUSED(context))
 
 enum { FORMAT_ALL, FORMAT_PUBLIC, FORMAT_BASE };
 
+static char *
+write_small_number(char *output, uint16_t number)
+{
+    if (number < 10) {
+        *output++ = (char)('0' + number);
+        return output;
+    }
+
+    char digits[5];  /* UINT16_MAX has five decimal digits. */
+    char *end = digits + sizeof(digits);
+    char *start = end;
+    do {
+        *--start = (char)('0' + number % 10);
+        number /= 10;
+    } while (number != 0);
+
+    size_t length = (size_t)(end - start);
+    memcpy(output, start, length);
+    return output + length;
+}
+
+static PyObject *
+format_small_version(const VersionObject *version, int mode)
+{
+    SmallParts parts = unpack_small(version);
+    /* Seven five-digit numbers, three dots, "rc", ".post" and ".dev". */
+    char buffer[7 * 5 + 3 + 2 + 5 + 4];
+    char *output = buffer;
+    for (int i = 0; i < parts.release_count; i++) {
+        if (i != 0) {
+            *output++ = '.';
+        }
+        output = write_small_number(output, parts.release[i]);
+    }
+    if (mode != FORMAT_BASE) {
+        if (parts.pre_letter != PRE_NONE) {
+            *output++ = PRE_NAMES[parts.pre_letter][0];
+            if (parts.pre_letter == PRE_RC) {
+                *output++ = 'c';
+            }
+            output = write_small_number(output, parts.pre_n);
+        }
+        if (parts.flags & 1) {
+            memcpy(output, ".post", 5);
+            output = write_small_number(output + 5, parts.post_n);
+        }
+        if (parts.flags & 2) {
+            memcpy(output, ".dev", 4);
+            output = write_small_number(output + 4, parts.dev_n);
+        }
+    }
+    return PyUnicode_FromStringAndSize(buffer, output - buffer);
+}
+
 static PyObject *
 format_version(PyObject *self, int mode)
 {
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
-        SmallParts parts = unpack_small(version);
-        char buffer[128];
-        int offset = 0;
-        for (int i = 0; i < parts.release_count; i++) {
-            offset += PyOS_snprintf(buffer + offset, sizeof(buffer) - offset,
-                                    "%s%u", i ? "." : "", parts.release[i]);
-        }
-        if (mode != FORMAT_BASE) {
-            if (parts.pre_letter != PRE_NONE) {
-                offset += PyOS_snprintf(
-                    buffer + offset, sizeof(buffer) - offset, "%s%u",
-                    PRE_NAMES[parts.pre_letter], parts.pre_n);
-            }
-            if (parts.flags & 1) {
-                offset +=
-                    PyOS_snprintf(buffer + offset, sizeof(buffer) - offset,
-                                  ".post%u", parts.post_n);
-            }
-            if (parts.flags & 2) {
-                offset +=
-                    PyOS_snprintf(buffer + offset, sizeof(buffer) - offset,
-                                  ".dev%u", parts.dev_n);
-            }
-        }
-        return PyUnicode_FromStringAndSize(buffer, offset);
+        return format_small_version(version, mode);
     }
 
     PyObject **parts = version->value.full->parts;
@@ -1701,14 +1731,15 @@ format_version(PyObject *self, int mode)
         return NULL;
     }
     int epoch = PyObject_IsTrue(parts[PART_EPOCH]);
-    if (epoch < 0 || (epoch && PyUnicodeWriter_Format(
-                                   writer, "%S!", parts[PART_EPOCH]) < 0)) {
+    if (epoch < 0 ||
+        (epoch && (PyUnicodeWriter_WriteStr(writer, parts[PART_EPOCH]) < 0 ||
+                   PyUnicodeWriter_WriteChar(writer, '!') < 0))) {
         goto error;
     }
     PyObject *release = parts[PART_RELEASE];
     for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(release); i++) {
-        if (PyUnicodeWriter_Format(writer, "%s%S", i ? "." : "",
-                                   PyTuple_GET_ITEM(release, i)) < 0) {
+        if ((i != 0 && PyUnicodeWriter_WriteChar(writer, '.') < 0) ||
+            PyUnicodeWriter_WriteStr(writer, PyTuple_GET_ITEM(release, i)) < 0) {
             goto error;
         }
     }
@@ -1717,16 +1748,18 @@ format_version(PyObject *self, int mode)
     }
     PyObject *pre = parts[PART_PRE];
     if (pre != Py_None &&
-        PyUnicodeWriter_Format(writer, "%S%S", PyTuple_GET_ITEM(pre, 0),
-                               PyTuple_GET_ITEM(pre, 1)) < 0) {
+        (PyUnicodeWriter_WriteStr(writer, PyTuple_GET_ITEM(pre, 0)) < 0 ||
+         PyUnicodeWriter_WriteStr(writer, PyTuple_GET_ITEM(pre, 1)) < 0)) {
         goto error;
     }
     if (parts[PART_POST] != Py_None &&
-        PyUnicodeWriter_Format(writer, ".post%S", parts[PART_POST]) < 0) {
+        (PyUnicodeWriter_WriteASCII(writer, ".post", 5) < 0 ||
+         PyUnicodeWriter_WriteStr(writer, parts[PART_POST]) < 0)) {
         goto error;
     }
     if (parts[PART_DEV] != Py_None &&
-        PyUnicodeWriter_Format(writer, ".dev%S", parts[PART_DEV]) < 0) {
+        (PyUnicodeWriter_WriteASCII(writer, ".dev", 4) < 0 ||
+         PyUnicodeWriter_WriteStr(writer, parts[PART_DEV]) < 0)) {
         goto error;
     }
     if (mode == FORMAT_ALL && parts[PART_LOCAL] != Py_None) {

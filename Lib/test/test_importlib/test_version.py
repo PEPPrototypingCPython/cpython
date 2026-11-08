@@ -253,6 +253,11 @@ class DisplayInt(int):
         return "number"
 
 
+class FailingDisplayInt(int):
+    def __str__(self):
+        raise RuntimeError("component formatting failed")
+
+
 class RequiredLabelVersion(Version):
     __slots__ = ("label",)
 
@@ -271,6 +276,41 @@ class MutableVersion(Version):
 
 
 class VersionTests(unittest.TestCase):
+    def test_compact_decimal_format_boundaries(self):
+        numbers = (0, 1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 65535)
+        for number in numbers:
+            for length in range(1, 5):
+                release = (number,) * length
+                base = ".".join([str(number)] * length)
+                for letter in ("a", "b", "rc"):
+                    with self.subTest(number=number, length=length, letter=letter):
+                        value = Version.from_parts(
+                            release=release, pre=(letter, number),
+                            post=number, dev=number,
+                        )
+                        expected = f"{base}{letter}{number}.post{number}.dev{number}"
+                        self.assertEqual(str(value), expected)
+                        self.assertEqual(value.public, expected)
+                        self.assertEqual(value.base_version, base)
+                        self.assertEqual(repr(value), f"<Version({expected!r})>")
+
+    def test_full_format_preserves_integer_subclass_display(self):
+        value = Version.from_parts(
+            epoch=DisplayInt(1), release=(DisplayInt(2),),
+            pre=("rc", DisplayInt(3)), post=DisplayInt(4), dev=DisplayInt(5),
+            local="local",
+        )
+        self.assertEqual(str(value), "number!numberrcnumber.postnumber.devnumber+local")
+        self.assertEqual(value.public, "number!numberrcnumber.postnumber.devnumber")
+        self.assertEqual(value.base_version, "number!number")
+
+    def test_full_format_propagates_component_errors(self):
+        value = Version.from_parts(release=(FailingDisplayInt(1),))
+        for operation in (str, repr, lambda v: v.public, lambda v: v.base_version):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(RuntimeError, "component formatting failed"):
+                    operation(value)
+
     def test_module_namespace(self):
         script_helper.assert_python_ok(
             "-I", "-c",
