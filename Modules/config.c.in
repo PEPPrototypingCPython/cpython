@@ -22,6 +22,7 @@ extern PyObject* PyInit__tokenize(void);
 extern PyObject* PyInit__contextvars(void);
 extern PyObject* _PyWarnings_Init(void);
 extern PyObject* PyInit__string(void);
+extern PyObject* PyInit_version(void);
 
 struct _inittab _PyImport_Inittab[] = {
 
@@ -54,6 +55,8 @@ struct _inittab _PyImport_Inittab[] = {
 
     /* This lives in Objects/unicodeobject.c */
     {"_string", PyInit__string},
+
+    {"importlib.version", PyInit_version},
 
     /* Sentinel */
     {0, 0}

@@ -53,7 +53,7 @@ ALLOW_TEST_MODULES = {
 
 # Built-in modules
 def list_builtin_modules(names: set[str]) -> None:
-    names |= set(sys.builtin_module_names)
+    names.update(name.partition('.')[0] for name in sys.builtin_module_names)
 
 
 # Pure Python modules (Lib/*.py)
@@ -82,7 +82,7 @@ def list_packages(names: set[str]) -> None:
 # includes Windows and macOS extensions.
 def list_modules_setup_extensions(names: set[str]) -> None:
     checker = ModuleChecker()
-    names.update(checker.list_module_names(all=True))
+    names.update(name.partition('.')[0] for name in checker.list_module_names(all=True))
 
 
 # List frozen modules of the PyImport_FrozenModules list (Python/frozen.c).
