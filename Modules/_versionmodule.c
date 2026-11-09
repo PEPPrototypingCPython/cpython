@@ -92,8 +92,13 @@
  * participate in a cycle.  Module state owns the type, exception and shared
  * stable suffix per interpreter.
  */
-#define PY_SSIZE_T_CLEAN
+#ifndef Py_BUILD_CORE_BUILTIN
+#  define Py_BUILD_CORE_MODULE 1
+#endif
+
 #include "Python.h"
+#include "pycore_call.h"          // _PyObject_MakeTpCall()
+#include "pycore_pystate.h"       // _PyThreadState_GET()
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -1151,6 +1156,30 @@ version_init(PyObject *self, PyObject *args, PyObject *keywords)
         return -1;
     }
     return parse_into_version(version_cast(self), text);
+}
+
+/* Version(text) skips tuple packing and format parsing.  Other call shapes
+ * take tp_call, so version_init reports their errors.  Subclasses do not
+ * inherit this slot. */
+static PyObject *
+version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
+                   PyObject *kwnames)
+{
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0)) {
+        return _PyObject_MakeTpCall(_PyThreadState_GET(), type, args, nargs,
+                                    kwnames);
+    }
+    PyTypeObject *version_type = (PyTypeObject *)type;
+    PyObject *target = version_type->tp_alloc(version_type, 0);
+    if (target == NULL) {
+        return NULL;
+    }
+    if (parse_into_version(version_cast(target), args[0]) < 0) {
+        Py_DECREF(target);
+        return NULL;
+    }
+    return target;
 }
 
 static int
@@ -2289,6 +2318,7 @@ PyDoc_STRVAR(version_doc, "Version(version)\n"
 static PyType_Slot version_slots[] = {
     {Py_tp_doc, (void *)version_doc},
     {Py_tp_init, version_init},
+    {Py_tp_vectorcall, version_vectorcall},
     {Py_tp_dealloc, version_dealloc},
     {Py_tp_traverse, version_traverse},
     {Py_tp_richcompare, version_richcompare},
