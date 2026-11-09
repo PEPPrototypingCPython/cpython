@@ -48,8 +48,9 @@
  *   phase 2: no prerelease
  * post has a presence bit and 16-bit number.  dev holds a present number or
  * 0x1ffff for absence, which sorts after all present development numbers.
- * Compare high then low.  Hash the tuple key so equal compact and full values
- * have equal hashes.
+ * Compare high then low.  Full values hash their tuple key; compact values
+ * compute the same tuple hash from C integers, so equal values of either
+ * storage have equal hashes.
  *
  * Construction and reads
  * ======================
@@ -99,6 +100,7 @@
 #include "Python.h"
 #include "pycore_call.h"          // _PyObject_MakeTpCall()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_tuple.h"         // _PyTuple_HASH_XXPRIME_1
 
 enum { PRE_A, PRE_B, PRE_RC, PRE_NONE = 0xff };
 /* SmallParts.flags */
@@ -420,6 +422,84 @@ unpack_small(const VersionObject *version)
         parts.release[i] = (uint16_t)(release >> (48 - 16 * i));
     }
     return parts;
+}
+
+/* The suffix tuple of the comparison key: (rank, pre number, post present,
+ * post number, dev absent, dev number).  Rank orders dev-only (-1), a, b, rc
+ * (0-2) and final or post releases (3). */
+typedef struct {
+    int rank;
+    uint16_t pre_n;
+    int has_post;
+    uint16_t post_n;
+    int has_dev;
+    uint16_t dev_n;
+} SuffixKey;
+
+static SuffixKey
+small_suffix(const SmallParts *parts)
+{
+    int has_post = (parts->flags & HAS_POST) != 0;
+    int has_dev = (parts->flags & HAS_DEV) != 0;
+    SuffixKey suffix = {
+        .pre_n = parts->pre_n,
+        .has_post = has_post,
+        .post_n = parts->post_n,
+        .has_dev = has_dev,
+        .dev_n = parts->dev_n,
+    };
+    if (parts->pre_letter != PRE_NONE) {
+        suffix.rank = parts->pre_letter;
+    }
+    else {
+        suffix.rank = has_dev && !has_post ? -1 : 3;
+    }
+    return suffix;
+}
+
+/* Mirror tuple_hash() in Objects/tupleobject.c over already hashed lanes. */
+static Py_uhash_t
+hash_lanes(const Py_uhash_t *lanes, Py_ssize_t length)
+{
+    Py_uhash_t acc = _PyTuple_HASH_XXPRIME_5;
+    for (Py_ssize_t i = 0; i < length; i++) {
+        acc += lanes[i] * _PyTuple_HASH_XXPRIME_2;
+        acc = _PyTuple_HASH_XXROTATE(acc);
+        acc *= _PyTuple_HASH_XXPRIME_1;
+    }
+    acc += length ^ (_PyTuple_HASH_XXPRIME_5 ^ 3527539UL);
+    if (acc == (Py_uhash_t)-1) {
+        acc = 1546275796;
+    }
+    return acc;
+}
+
+/* Hash of the tuple key (0, trimmed release, suffix) without building it.
+ * Small nonnegative ints and bools hash to their value; hash(-1) is -2. */
+static Py_hash_t
+small_hash(const VersionObject *version)
+{
+    SmallParts parts = unpack_small(version);
+    SuffixKey suffix = small_suffix(&parts);
+    Py_uhash_t release[4];
+    Py_ssize_t count = parts.release_count;
+    while (count > 0 && parts.release[count - 1] == 0) {
+        count--;
+    }
+    for (Py_ssize_t i = 0; i < count; i++) {
+        release[i] = parts.release[i];
+    }
+    Py_uhash_t suffix_lanes[6] = {
+        suffix.rank == -1 ? (Py_uhash_t)-2 : (Py_uhash_t)suffix.rank,
+        suffix.pre_n,
+        suffix.has_post != 0,
+        suffix.post_n,
+        suffix.has_dev == 0,
+        suffix.dev_n,
+    };
+    Py_uhash_t lanes[3] = {0, hash_lanes(release, count),
+                           hash_lanes(suffix_lanes, 6)};
+    return (Py_hash_t)hash_lanes(lanes, 3);
 }
 
 /* Ownership transfers only after all fields are ready for readers. */
@@ -2117,14 +2197,19 @@ version_hash(PyObject *self)
     if (hash != -1) {
         return hash;
     }
-    PyObject *key = get_cmpkey(self);
-    if (key == NULL) {
-        return -1;
+    if (is_small(version)) {
+        hash = small_hash(version);
     }
-    hash = PyObject_Hash(key);
-    Py_DECREF(key);
-    if (hash == -1) {
-        return -1;
+    else {
+        PyObject *key = get_cmpkey(self);
+        if (key == NULL) {
+            return -1;
+        }
+        hash = PyObject_Hash(key);
+        Py_DECREF(key);
+        if (hash == -1) {
+            return -1;
+        }
     }
     Py_hash_t expected = -1;
     _Py_atomic_compare_exchange_ssize(&version->hash, &expected, hash);

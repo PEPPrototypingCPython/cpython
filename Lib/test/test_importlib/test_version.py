@@ -589,6 +589,31 @@ else:
             with self.assertRaises(TypeError):
                 op(Version("1"), object())
 
+    def test_hash_matches_across_storage(self):
+        # Five release components force full storage; the compact form
+        # of an equal value must hash the same.
+        for compact, full in [
+            ("1", "1.0.0.0.0"),
+            ("1.2a3", "1.2.0.0.0a3"),
+            ("1.0.dev1", "1.0.0.0.0.dev1"),
+            ("1.0.post2", "1.0.0.0.0.post2"),
+            ("1.0a0.post0.dev0", "1.0.0.0.0a0.post0.dev0"),
+            ("1.0.post1.dev2", "1.0.0.0.0.post1.dev2"),
+            ("65535.65535.65535.65535", "65535.65535.65535.65535.0"),
+        ]:
+            with self.subTest(compact=compact):
+                left, right = Version(compact), Version(full)
+                self.assertEqual(sys.getsizeof(left), sys.getsizeof(Version("1")))
+                self.assertGreater(sys.getsizeof(right), sys.getsizeof(left))
+                self.assertEqual(left, right)
+                self.assertEqual(hash(left), hash(right))
+                self.assertEqual(hash(left), hash(Version(compact)))
+        class Tagged(int):
+            pass
+        full = Version.from_parts(release=(Tagged(1), 2))
+        self.assertGreater(sys.getsizeof(full), sys.getsizeof(Version("1.2")))
+        self.assertEqual(hash(full), hash(Version("1.2")))
+
     def test_component_factories(self):
         value = Version.from_parts(
             epoch=2,
