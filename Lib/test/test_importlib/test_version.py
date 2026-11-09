@@ -589,6 +589,39 @@ else:
             with self.assertRaises(TypeError):
                 op(Version("1"), object())
 
+    def test_ordering_of_full_storage(self):
+        # Ascending.  Each entry is a group of equal values.
+        groups = [
+            [Version("1.2+a")],
+            [Version("1.2+b"), Version("1.2.0.0.0.0+b"),
+             Version.from_parts(release=(1, 2, 0), local="b")],
+            [Version("1.2+1")],
+            [Version("1.2.0.0.1"), Version.from_parts(release=(1, 2, 0, 0, 1))],
+            [Version("1.2.0.0.1+a")],
+            [Version("1.3.dev1+z")],
+            [Version("1.3rc1+a"),
+             Version.from_parts(release=(1, 3), pre=("rc", OwnedInt(1)),
+                                local="a")],
+            [Version("1.3"), Version.from_parts(release=(1, 3, 0, 0, 0))],
+            [Version("1.3+a")],
+            [Version("1.70000")],
+            [Version("1.70000+a")],
+            [Version("1!0+a")],
+        ]
+        values = [(i, value) for i, group in enumerate(groups)
+                  for value in group]
+        for i, left in values:
+            for j, right in values:
+                with self.subTest(left=left, right=right):
+                    self.assertEqual(left < right, i < j)
+                    self.assertEqual(left <= right, i <= j)
+                    self.assertEqual(left == right, i == j)
+                    self.assertEqual(left != right, i != j)
+                    self.assertEqual(left >= right, i >= j)
+                    self.assertEqual(left > right, i > j)
+                    if i == j:
+                        self.assertEqual(hash(left), hash(right))
+
     def test_subclass_construction_paths(self):
         class Plain(Version):
             pass
