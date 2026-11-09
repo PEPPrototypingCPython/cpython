@@ -1713,6 +1713,7 @@ extern "C" {
     INIT_ID(desired_access), \
     INIT_ID(detect_types), \
     INIT_ID(deterministic), \
+    INIT_ID(dev), \
     INIT_ID(device), \
     INIT_ID(dict), \
     INIT_ID(difference_update), \
@@ -1743,6 +1744,7 @@ extern "C" {
     INIT_ID(endpos), \
     INIT_ID(entrypoint), \
     INIT_ID(env), \
+    INIT_ID(epoch), \
     INIT_ID(error_rate), \
     INIT_ID(errors), \
     INIT_ID(event), \
@@ -1907,6 +1909,7 @@ extern "C" {
     INIT_ID(lineno), \
     INIT_ID(little), \
     INIT_ID(lo), \
+    INIT_ID(local), \
     INIT_ID(locale), \
     INIT_ID(locals), \
     INIT_ID(logoption), \
@@ -2021,6 +2024,8 @@ extern "C" {
     INIT_ID(pos1), \
     INIT_ID(pos2), \
     INIT_ID(posix), \
+    INIT_ID(post), \
+    INIT_ID(pre), \
     INIT_ID(prec), \
     INIT_ID(preserve_exc), \
     INIT_ID(print_file_and_line), \
