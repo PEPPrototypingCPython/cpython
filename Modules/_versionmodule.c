@@ -76,6 +76,8 @@
  *
  * publish_version installs one complete value under the object lock, then
  * release-stores ready.  Readers acquire ready before reading the union.
+ * Objects created by the constructor paths are not yet shared, so
+ * publish_fresh skips the lock.
  * Empty objects have ready == 0 and own no full allocation, even though their
  * release_len is zero.  __sizeof__ must check ready too: another thread may
  * still be initializing an object exposed through object.__new__.
@@ -518,6 +520,16 @@ small_hash(const VersionObject *version)
     return (Py_hash_t)hash_lanes(lanes, 3);
 }
 
+/* Install the value into an object no other thread can see yet. */
+static void
+publish_fresh(VersionObject *target, uint8_t release_len, VersionValue value)
+{
+    target->release_len = release_len;
+    target->value = value;
+    target->hash = -1;
+    _Py_atomic_store_uint32_release(&target->ready, 1);
+}
+
 /* Ownership transfers only after all fields are ready for readers. */
 static int
 publish_version(VersionObject *target, uint8_t release_len, VersionValue value)
@@ -570,16 +582,16 @@ full_from_parts(PyObject *const *parts)
     return full;
 }
 
-/* Takes ownership of value, including on allocation or publication failure. */
+/* Takes ownership of value, including on allocation failure. */
 static PyObject *
 version_from_value(PyTypeObject *type, uint8_t release_len, VersionValue value)
 {
     VersionObject *target = (VersionObject *)type->tp_alloc(type, 0);
-    if (target == NULL || publish_version(target, release_len, value) < 0) {
+    if (target == NULL) {
         clear_value(release_len, value);
-        Py_XDECREF(target);
         return NULL;
     }
+    publish_fresh(target, release_len, value);
     return (PyObject *)target;
 }
 
@@ -998,10 +1010,11 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
     return 0;
 }
 
+/* Parse text into an unpublished value; the caller owns the result. */
 static int
-parse_into_version(VersionObject *target, PyObject *original)
+parse_value(PyTypeObject *type, PyObject *original, uint8_t *release_len_out,
+            VersionValue *value_out)
 {
-    PyTypeObject *type = Py_TYPE(target);
     PyObject *text = NULL;
     if (!PyUnicode_Check(original)) {
         goto invalid;
@@ -1071,16 +1084,29 @@ parse_into_version(VersionObject *target, PyObject *original)
         }
     }
     Py_DECREF(text);
-    if (publish_version(target, release_len, value) < 0) {
-        clear_value(release_len, value);
-        return -1;
-    }
+    *release_len_out = release_len;
+    *value_out = value;
     return 0;
 
 invalid:
     Py_XDECREF(text);
     format_invalid_version(type, "Invalid version: %R", original);
     return -1;
+}
+
+static int
+parse_into_version(VersionObject *target, PyObject *original)
+{
+    uint8_t release_len;
+    VersionValue value;
+    if (parse_value(Py_TYPE(target), original, &release_len, &value) < 0) {
+        return -1;
+    }
+    if (publish_version(target, release_len, value) < 0) {
+        clear_value(release_len, value);
+        return -1;
+    }
+    return 0;
 }
 
 /* Match pickle's default dictionary and slot restoration for subclasses. */
@@ -1243,16 +1269,12 @@ version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
         return _PyObject_MakeTpCall(_PyThreadState_GET(), type, args, nargs,
                                     kwnames);
     }
-    PyTypeObject *version_type = (PyTypeObject *)type;
-    PyObject *target = version_type->tp_alloc(version_type, 0);
-    if (target == NULL) {
+    uint8_t release_len;
+    VersionValue value;
+    if (parse_value((PyTypeObject *)type, args[0], &release_len, &value) < 0) {
         return NULL;
     }
-    if (parse_into_version(version_cast(target), args[0]) < 0) {
-        Py_DECREF(target);
-        return NULL;
-    }
-    return target;
+    return version_from_value((PyTypeObject *)type, release_len, value);
 }
 
 static int
