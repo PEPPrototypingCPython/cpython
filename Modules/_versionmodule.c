@@ -586,10 +586,19 @@ make_full_parts(PyTypeObject *type, PyObject *const *parts)
     return version_from_value(type, 0, value);
 }
 
-/* PyLong_FromString needs a terminated string; digit runs end mid-buffer. */
+/* Convert a validated ASCII digit run.  Runs of up to 18 digits fit in a
+ * long long; longer runs go through PyLong_FromString, which needs a
+ * terminated copy because digit runs end mid-buffer. */
 static PyObject *
 long_from(const char *s, Py_ssize_t len)
 {
+    if (len <= 18) {
+        long long value = 0;
+        for (Py_ssize_t i = 0; i < len; i++) {
+            value = value * 10 + (s[i] - '0');
+        }
+        return PyLong_FromLongLong(value);
+    }
     char stackbuf[32];
     char *buf = (len < (Py_ssize_t)sizeof(stackbuf)) ? stackbuf
                                                      : PyMem_Malloc(len + 1);
@@ -901,15 +910,19 @@ normalize_local(PyObject *value, PyTypeObject *type)
     return NULL;
 }
 
+static PyObject *
+number_or_zero(const NumberField *field)
+{
+    return field->len ? long_from(field->s, field->len) : PyLong_FromLong(0);
+}
+
 static int
 parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
 {
     for (int i = 0; i < PART_COUNT; i++) {
         parts[i] = Py_NewRef(Py_None);
     }
-    Py_SETREF(parts[PART_EPOCH],
-              parsed->has_epoch ? long_from(parsed->epoch.s, parsed->epoch.len)
-                                : PyLong_FromLong(0));
+    Py_SETREF(parts[PART_EPOCH], number_or_zero(&parsed->epoch));
     if (parts[PART_EPOCH] == NULL) {
         return -1;
     }
@@ -935,33 +948,28 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
         return -1;
     }
     if (parsed->has_pre) {
-        PyObject *number = parsed->pre_n.len
-                               ? long_from(parsed->pre_n.s, parsed->pre_n.len)
-                               : PyLong_FromLong(0);
-        if (number == NULL) {
+        PyObject *letter = PyUnicode_FromString(PRE_NAMES[parsed->pre_letter]);
+        PyObject *number = number_or_zero(&parsed->pre_n);
+        if (letter == NULL || number == NULL) {
+            Py_XDECREF(letter);
+            Py_XDECREF(number);
             return -1;
         }
-        Py_SETREF(
-            parts[PART_PRE],
-            Py_BuildValue("(sN)", PRE_NAMES[parsed->pre_letter], number));
+        Py_SETREF(parts[PART_PRE], PyTuple_Pack(2, letter, number));
+        Py_DECREF(letter);
+        Py_DECREF(number);
         if (parts[PART_PRE] == NULL) {
             return -1;
         }
     }
     if (parsed->has_post) {
-        Py_SETREF(parts[PART_POST],
-                  parsed->post_n.len
-                      ? long_from(parsed->post_n.s, parsed->post_n.len)
-                      : PyLong_FromLong(0));
+        Py_SETREF(parts[PART_POST], number_or_zero(&parsed->post_n));
         if (parts[PART_POST] == NULL) {
             return -1;
         }
     }
     if (parsed->has_dev) {
-        Py_SETREF(parts[PART_DEV],
-                  parsed->dev_n.len
-                      ? long_from(parsed->dev_n.s, parsed->dev_n.len)
-                      : PyLong_FromLong(0));
+        Py_SETREF(parts[PART_DEV], number_or_zero(&parsed->dev_n));
         if (parts[PART_DEV] == NULL) {
             return -1;
         }
