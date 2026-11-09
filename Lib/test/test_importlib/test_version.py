@@ -589,6 +589,50 @@ else:
             with self.assertRaises(TypeError):
                 op(Version("1"), object())
 
+    def test_subclass_construction_paths(self):
+        class Plain(Version):
+            pass
+
+        class WithInit(Version):
+            def __init__(self, text, tag):
+                super().__init__(text)
+                self.tag = tag
+
+        class WithNew(Version):
+            def __new__(cls, text):
+                return super().__new__(cls)
+
+        class Mixin:
+            seen = {}
+
+            def __init_subclass__(cls, **kwargs):
+                Mixin.seen[cls.__name__] = kwargs
+                super().__init_subclass__()
+
+        class Cooperative(Version, Mixin, flag=1):
+            pass
+
+        self.assertEqual(Plain("1.2"), Version("1.2"))
+        self.assertIs(type(Plain("1.2")), Plain)
+        for call in (lambda: Plain(), lambda: Plain("1", "2"),
+                     lambda: Plain(version="1")):
+            with self.assertRaises(TypeError):
+                call()
+        value = WithInit("1.2", "x")
+        self.assertEqual((value, value.tag), (Version("1.2"), "x"))
+        self.assertEqual(WithNew("1.2"), Version("1.2"))
+        self.assertEqual(Mixin.seen, {"Cooperative": {"flag": 1}})
+        self.assertEqual(Cooperative("1.2"), Version("1.2"))
+
+        def late_init(self, text):
+            Version.__init__(self, text)
+            self.late = True
+
+        Plain.__init__ = late_init
+        self.assertTrue(Plain("1.2").late)
+        del Plain.__init__
+        self.assertFalse(hasattr(Plain("1.2"), "late"))
+
     def test_hash_matches_across_storage(self):
         # Five release components force full storage; the compact form
         # of an equal value must hash the same.

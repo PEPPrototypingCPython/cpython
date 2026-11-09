@@ -1257,15 +1257,20 @@ version_init(PyObject *self, PyObject *args, PyObject *keywords)
     return parse_into_version(version_cast(self), text);
 }
 
-/* Version(text) skips tuple packing and format parsing.  Other call shapes
- * take tp_call, so version_init reports their errors.  Subclasses do not
- * inherit this slot. */
+/* Version(text) skips tuple packing and format parsing.  Other call shapes,
+ * and types with their own __new__ or __init__, take tp_call so that those
+ * methods run and version_init reports argument errors.  The slot check
+ * happens on every call because __init__ can be assigned after class
+ * creation. */
 static PyObject *
 version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
                    PyObject *kwnames)
 {
     Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0)) {
+    PyTypeObject *version_type = (PyTypeObject *)type;
+    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0) ||
+        version_type->tp_init != version_init ||
+        version_type->tp_new != PyBaseObject_Type.tp_new) {
         return _PyObject_MakeTpCall(_PyThreadState_GET(), type, args, nargs,
                                     kwnames);
     }
@@ -1275,6 +1280,36 @@ version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
         return NULL;
     }
     return version_from_value((PyTypeObject *)type, release_len, value);
+}
+
+/* Subclasses do not inherit tp_vectorcall; install it from
+ * __init_subclass__ after calling the next one in the MRO. */
+static PyObject *
+version_init_subclass(PyObject *cls, PyObject *const *args, Py_ssize_t nargs,
+                      PyObject *kwnames)
+{
+    VersionState *state = state_from_type((PyTypeObject *)cls);
+    if (state == NULL) {
+        return NULL;
+    }
+    PyObject *super_args[2] = {state->version_type, cls};
+    PyObject *super = PyObject_Vectorcall((PyObject *)&PySuper_Type,
+                                          super_args, 2, NULL);
+    if (super == NULL) {
+        return NULL;
+    }
+    PyObject *next = PyObject_GetAttrString(super, "__init_subclass__");
+    Py_DECREF(super);
+    if (next == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyObject_Vectorcall(next, args, nargs, kwnames);
+    Py_DECREF(next);
+    if (result == NULL) {
+        return NULL;
+    }
+    ((PyTypeObject *)cls)->tp_vectorcall = version_vectorcall;
+    return result;
 }
 
 static int
@@ -2429,6 +2464,11 @@ static PyMethodDef version_methods[] = {
      "__setstate__($self, state, /)\n"
      "--\n\n"
      "Restore an empty value or subclass attributes."},
+    {"__init_subclass__", (PyCFunction)(void (*)(void))version_init_subclass,
+     METH_FASTCALL | METH_KEYWORDS | METH_CLASS,
+     "__init_subclass__($type, /, *args, **kwargs)\n"
+     "--\n\n"
+     "Give the subclass the constructor fast path."},
     {NULL, NULL, 0, NULL},
 };
 
