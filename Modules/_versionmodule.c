@@ -98,6 +98,7 @@
 
 #include "Python.h"
 #include "pycore_call.h"          // _PyObject_MakeTpCall()
+#include "pycore_modsupport.h"    // _PyArg_NoKeywords()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 
 #include <stdarg.h>
@@ -1150,9 +1151,9 @@ version_init(PyObject *self, PyObject *args, PyObject *keywords)
         PyErr_SetString(PyExc_TypeError, "Version is already initialized");
         return -1;
     }
-    char *names[] = {"version", NULL};
     PyObject *text;
-    if (!PyArg_ParseTupleAndKeywords(args, keywords, "O:Version", names, &text)) {
+    if (!_PyArg_NoKeywords("Version", keywords) ||
+        !PyArg_ParseTuple(args, "O:Version", &text)) {
         return -1;
     }
     return parse_into_version(version_cast(self), text);
@@ -2311,7 +2312,7 @@ version_dealloc(PyObject *self)
     Py_DECREF(type);
 }
 
-PyDoc_STRVAR(version_doc, "Version(version)\n"
+PyDoc_STRVAR(version_doc, "Version(version, /)\n"
                           "--\n\n"
                           "An immutable distribution version value.");
 

@@ -13,7 +13,7 @@ using the `Version Specifiers specification`_.
 
 .. _Version Specifiers specification: https://packaging.python.org/en/latest/specifications/version-specifiers/
 
-.. class:: Version(version)
+.. class:: Version(version, /)
 
    Parse a version string into an immutable value.
 
