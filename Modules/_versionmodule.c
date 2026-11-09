@@ -1794,7 +1794,17 @@ format_small_version(const VersionObject *version, int mode)
             output = write_small_number(output + 4, parts.dev_n);
         }
     }
-    return PyUnicode_FromStringAndSize(buffer, output - buffer);
+    /* The buffer is ASCII, so skip the UTF-8 decoder.  Single characters
+     * come from the interpreter's shared cache. */
+    Py_ssize_t length = output - buffer;
+    if (length == 1) {
+        return PyUnicode_FromOrdinal(buffer[0]);
+    }
+    PyObject *text = PyUnicode_New(length, 127);
+    if (text != NULL) {
+        memcpy(PyUnicode_1BYTE_DATA(text), buffer, (size_t)length);
+    }
+    return text;
 }
 
 static PyObject *
