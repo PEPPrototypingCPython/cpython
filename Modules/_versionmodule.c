@@ -17,7 +17,7 @@
  *   | cached hash        |                 |   epoch, release,    |
  *   | release_len, ready |                 |   pre, post, dev,     |
  *   | value              |--- full ------->|   local              |
- *   | replacement        |                 | cached tuple key     |
+ *   | replacement        |                 | cached key and text  |
  *   +--------------------+                 +----------------------+
  *
  * After initialization, release_len selects the VersionValue union member:
@@ -66,7 +66,8 @@
  * borrows spans from the input string, which stays owned until parsing ends.
  * Compact parsing creates no Python component objects.  Getters, formatting
  * and mixed comparisons unpack components as needed without changing storage.
- * Full values cache their tuple key; compact values cache only their hash.
+ * Full values cache their tuple key and their str(); compact values cache
+ * only their hash.
  * __replace__ chooses storage for a new value when components change.
  *
  * Initialization and ownership
@@ -138,6 +139,7 @@ typedef struct {
 typedef struct {
     PyObject *parts[PART_COUNT];
     PyObject *key;
+    PyObject *text;
 } VersionFull;
 
 typedef union {
@@ -528,6 +530,7 @@ free_full(VersionFull *full)
 {
     clear_parts(full->parts);
     Py_XDECREF(full->key);
+    Py_XDECREF(full->text);
     PyMem_Free(full);
 }
 
@@ -1693,13 +1696,8 @@ format_small_version(const VersionObject *version, int mode)
 }
 
 static PyObject *
-format_version(PyObject *self, int mode)
+format_full_version(const VersionObject *version, int mode)
 {
-    VersionObject *version = version_cast(self);
-    if (is_small(version)) {
-        return format_small_version(version, mode);
-    }
-
     PyObject **parts = version->value.full->parts;
     PyUnicodeWriter *writer = PyUnicodeWriter_Create(0);
     if (writer == NULL) {
@@ -1748,6 +1746,38 @@ format_version(PyObject *self, int mode)
 error:
     PyUnicodeWriter_Discard(writer);
     return NULL;
+}
+
+static PyObject *
+format_version(PyObject *self, int mode)
+{
+    VersionObject *version = version_cast(self);
+    if (is_small(version)) {
+        return format_small_version(version, mode);
+    }
+    if (mode != FORMAT_ALL) {
+        return format_full_version(version, mode);
+    }
+    PyObject *text;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    text = Py_XNewRef(version->value.full->text);
+    Py_END_CRITICAL_SECTION();
+    if (text != NULL) {
+        return text;
+    }
+    /* Component __str__ methods run unlocked; store only a finished result. */
+    PyObject *created = format_full_version(version, FORMAT_ALL);
+    if (created == NULL) {
+        return NULL;
+    }
+    Py_BEGIN_CRITICAL_SECTION(self);
+    if (version->value.full->text == NULL) {
+        version->value.full->text = Py_NewRef(created);
+    }
+    text = Py_NewRef(version->value.full->text);
+    Py_END_CRITICAL_SECTION();
+    Py_DECREF(created);
+    return text;
 }
 
 static PyObject *
@@ -2306,6 +2336,7 @@ version_traverse(PyObject *self, visitproc visit, void *arg)
             Py_VISIT(version->value.full->parts[i]);
         }
         Py_VISIT(version->value.full->key);
+        Py_VISIT(version->value.full->text);
     }
     return 0;
 }
