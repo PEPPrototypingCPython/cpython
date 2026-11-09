@@ -66,8 +66,9 @@
  * borrows spans from the input string, which stays owned until parsing ends.
  * Compact parsing creates no Python component objects.  Getters, formatting
  * and mixed comparisons unpack components as needed without changing storage.
- * Full values cache their tuple key and their str(); compact values cache
- * only their hash.
+ * Full values cache their tuple key, their str() and, when the public
+ * components fit, a packed key for comparisons against compact values;
+ * compact values cache only their hash.
  * __replace__ chooses storage for a new value when components change.
  *
  * Initialization and ownership
@@ -136,10 +137,15 @@ typedef struct {
     uint64_t low;
 } VersionKey;
 
+enum { PUBLIC_KEY_UNKNOWN, PUBLIC_KEY_PACKED, PUBLIC_KEY_WIDE };
+
 typedef struct {
     PyObject *parts[PART_COUNT];
     PyObject *key;
     PyObject *text;
+    /* Public components packed like a compact key, when they fit. */
+    VersionKey public_key;
+    uint8_t public_key_state;
 } VersionFull;
 
 typedef union {
@@ -426,6 +432,17 @@ unpack_small(const VersionObject *version)
     return parts;
 }
 
+/* Release count without trailing zeros, as the ordering key uses. */
+static Py_ssize_t
+small_trimmed_count(const SmallParts *parts)
+{
+    Py_ssize_t count = parts->release_count;
+    while (count > 0 && parts->release[count - 1] == 0) {
+        count--;
+    }
+    return count;
+}
+
 /* The suffix tuple of the comparison key: (rank, pre number, post present,
  * post number, dev absent, dev number).  Rank orders dev-only (-1), a, b, rc
  * (0-2) and final or post releases (3). */
@@ -484,10 +501,7 @@ small_hash(const VersionObject *version)
     SmallParts parts = unpack_small(version);
     SuffixKey suffix = small_suffix(&parts);
     Py_uhash_t release[4];
-    Py_ssize_t count = parts.release_count;
-    while (count > 0 && parts.release[count - 1] == 0) {
-        count--;
-    }
+    Py_ssize_t count = small_trimmed_count(&parts);
     for (Py_ssize_t i = 0; i < count; i++) {
         release[i] = parts.release[i];
     }
@@ -1370,9 +1384,10 @@ small_number(PyObject *value, uint16_t *result)
 }
 
 /* Apply the given normalized parts to small; NULL parts keep their value.
- * Return 0 if a part needs full storage. */
+ * Return 0 if a part needs full storage.  trim_release drops trailing
+ * release zeros first, as the ordering key does. */
 static int
-apply_small_parts(SmallParts *small, PyObject *const *parts)
+apply_small_parts(SmallParts *small, PyObject *const *parts, int trim_release)
 {
     if (parts[PART_EPOCH] && (!PyLong_CheckExact(parts[PART_EPOCH]) ||
                               !PyLong_IsZero(parts[PART_EPOCH]))) {
@@ -1384,6 +1399,13 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
     if (parts[PART_RELEASE]) {
         PyObject *release = parts[PART_RELEASE];
         Py_ssize_t count = PyTuple_GET_SIZE(release);
+        while (trim_release && count > 0) {
+            PyObject *last = PyTuple_GET_ITEM(release, count - 1);
+            if (!PyLong_CheckExact(last) || !PyLong_IsZero(last)) {
+                break;
+            }
+            count--;
+        }
         if (count > 4) {
             return 0;
         }
@@ -1424,11 +1446,26 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
     return 1;
 }
 
+/* Pack the public components of full storage when they fit a compact key. */
+static int
+pack_public_key(PyObject *const *parts, VersionKey *key)
+{
+    PyObject *public_parts[PART_COUNT];
+    memcpy(public_parts, parts, sizeof(public_parts));
+    public_parts[PART_LOCAL] = NULL;
+    SmallParts small = {0};
+    if (!apply_small_parts(&small, public_parts, 1)) {
+        return 0;
+    }
+    *key = pack_small_key(&small);
+    return 1;
+}
+
 static PyObject *
 make_parts(PyTypeObject *type, PyObject *const *parts)
 {
     SmallParts small = {0};
-    if (apply_small_parts(&small, parts)) {
+    if (apply_small_parts(&small, parts, 0)) {
         return make_small_parts(type, &small);
     }
     return make_full_parts(type, parts);
@@ -1961,7 +1998,7 @@ replace_parts(PyObject *self, PyObject *const *arguments,
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
         SmallParts small = unpack_small(version);
-        if (apply_small_parts(&small, parts)) {
+        if (apply_small_parts(&small, parts, 0)) {
             VersionKey key = pack_small_key(&small);
             int unchanged = small.release_count == version->release_len &&
                             key.high == version->value.key.high &&
@@ -2129,19 +2166,54 @@ done:
     return result;
 }
 
+/* Same shape as build_cmpkey, from the packed fields. */
+static PyObject *
+build_small_cmpkey(PyTypeObject *type, const VersionObject *version)
+{
+    SmallParts parts = unpack_small(version);
+    SuffixKey suffix = small_suffix(&parts);
+    TupleBuilder builder;
+    if (tuple_builder_init(&builder, small_trimmed_count(&parts)) < 0) {
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < builder.length; i++) {
+        builder.items[i] = PyLong_FromLong(parts.release[i]);
+        if (builder.items[i] == NULL) {
+            tuple_builder_clear(&builder);
+            return NULL;
+        }
+    }
+    PyObject *release = tuple_builder_finish(&builder);
+    if (release == NULL) {
+        return NULL;
+    }
+    PyObject *suffix_key;
+    if (suffix.rank == 3 && !suffix.has_post && !suffix.has_dev) {
+        VersionState *state = state_from_type(type);
+        suffix_key = state == NULL ? NULL : Py_NewRef(state->stable_suffix);
+    }
+    else {
+        suffix_key = Py_BuildValue("(iIiIiI)", suffix.rank,
+                                   (unsigned int)suffix.pre_n, suffix.has_post,
+                                   (unsigned int)suffix.post_n, !suffix.has_dev,
+                                   (unsigned int)suffix.dev_n);
+    }
+    PyObject *result = NULL;
+    if (suffix_key != NULL) {
+        result = PyTuple_Pack(3, Py_GetConstantBorrowed(Py_CONSTANT_ZERO),
+                              release, suffix_key);
+    }
+    Py_DECREF(release);
+    Py_XDECREF(suffix_key);
+    return result;
+}
+
 static PyObject *
 get_cmpkey(PyObject *self)
 {
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
-        PyObject *parts[PART_COUNT] = {0};
-        if (parts_from_version(self, parts) < 0) {
-            clear_parts(parts);
-            return NULL;
-        }
-        PyObject *key = build_cmpkey(Py_TYPE(self), parts);
-        clear_parts(parts);
-        return key;
+        return build_small_cmpkey(Py_TYPE(self), version);
     }
 
     PyObject *key;
@@ -2171,20 +2243,56 @@ get_cmpkey(PyObject *self)
     return key;
 }
 
+static int
+compare_keys(VersionKey a, VersionKey b)
+{
+    return a.high < b.high   ? -1
+           : a.high > b.high ? 1
+           : a.low < b.low   ? -1
+           : a.low > b.low   ? 1
+                             : 0;
+}
+
+/* Fill key and has_local for a full value whose public part packs. */
+static int
+public_key(PyObject *self, VersionKey *key, int *has_local)
+{
+    VersionFull *full = version_cast(self)->value.full;
+    int state;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    if (full->public_key_state == PUBLIC_KEY_UNKNOWN) {
+        full->public_key_state = pack_public_key(full->parts, &full->public_key)
+                                     ? PUBLIC_KEY_PACKED
+                                     : PUBLIC_KEY_WIDE;
+    }
+    state = full->public_key_state;
+    *key = full->public_key;
+    Py_END_CRITICAL_SECTION();
+    *has_local = full->parts[PART_LOCAL] != Py_None;
+    return state == PUBLIC_KEY_PACKED;
+}
+
 static PyObject *
 compare_current_versions(PyObject *self, PyObject *other, int op)
 {
     VersionObject *left = version_cast(self);
     VersionObject *right = version_cast(other);
     if (is_small(left) && is_small(right)) {
-        VersionKey a = left->value.key;
-        VersionKey b = right->value.key;
-        int comparison = a.high < b.high   ? -1
-                         : a.high > b.high ? 1
-                         : a.low < b.low   ? -1
-                         : a.low > b.low   ? 1
-                                           : 0;
+        int comparison = compare_keys(left->value.key, right->value.key);
         Py_RETURN_RICHCOMPARE(comparison, 0, op);
+    }
+    /* One compact side: compare packed keys; a local label breaks ties. */
+    if (is_small(left) != is_small(right)) {
+        VersionKey key;
+        int has_local;
+        if (is_small(left) && public_key(other, &key, &has_local)) {
+            int comparison = compare_keys(left->value.key, key);
+            Py_RETURN_RICHCOMPARE(comparison != 0 ? comparison : -has_local, 0, op);
+        }
+        if (is_small(right) && public_key(self, &key, &has_local)) {
+            int comparison = compare_keys(key, right->value.key);
+            Py_RETURN_RICHCOMPARE(comparison != 0 ? comparison : has_local, 0, op);
+        }
     }
     PyObject *a = get_cmpkey(self);
     if (a == NULL) {
