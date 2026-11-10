@@ -101,6 +101,10 @@ using the `Version Specifiers specification`_.
       of nonnegative integers; ``local`` is a string or ``None``. Subclass string
       constructors and initializers are not invoked.
 
+      Integer subclasses are kept as given and must behave as immutable values.
+      A version caches its string form, hash and ordering key, so later changes
+      to a component's :meth:`~object.__str__` or comparison are not seen.
+
    .. method:: __replace__(*, epoch=..., release=..., pre=..., post=..., dev=..., local=...)
 
       Return a version with the supplied components replaced. Omitted components

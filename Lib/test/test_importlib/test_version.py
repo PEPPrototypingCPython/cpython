@@ -589,6 +589,108 @@ else:
             with self.assertRaises(TypeError):
                 op(Version("1"), object())
 
+    def test_ordering_of_full_storage(self):
+        # Ascending.  Each entry is a group of equal values.
+        groups = [
+            [Version("1.2+a")],
+            [Version("1.2+b"), Version("1.2.0.0.0.0+b"),
+             Version.from_parts(release=(1, 2, 0), local="b")],
+            [Version("1.2+1")],
+            [Version("1.2.0.0.1"), Version.from_parts(release=(1, 2, 0, 0, 1))],
+            [Version("1.2.0.0.1+a")],
+            [Version("1.3.dev1+z")],
+            [Version("1.3rc1+a"),
+             Version.from_parts(release=(1, 3), pre=("rc", OwnedInt(1)),
+                                local="a")],
+            [Version("1.3"), Version.from_parts(release=(1, 3, 0, 0, 0))],
+            [Version("1.3+a")],
+            [Version("1.70000")],
+            [Version("1.70000+a")],
+            [Version("1!0+a")],
+        ]
+        values = [(i, value) for i, group in enumerate(groups)
+                  for value in group]
+        for i, left in values:
+            for j, right in values:
+                with self.subTest(left=left, right=right):
+                    self.assertEqual(left < right, i < j)
+                    self.assertEqual(left <= right, i <= j)
+                    self.assertEqual(left == right, i == j)
+                    self.assertEqual(left != right, i != j)
+                    self.assertEqual(left >= right, i >= j)
+                    self.assertEqual(left > right, i > j)
+                    if i == j:
+                        self.assertEqual(hash(left), hash(right))
+
+    def test_subclass_construction_paths(self):
+        class Plain(Version):
+            pass
+
+        class WithInit(Version):
+            def __init__(self, text, tag):
+                super().__init__(text)
+                self.tag = tag
+
+        class WithNew(Version):
+            def __new__(cls, text):
+                return super().__new__(cls)
+
+        class Mixin:
+            seen = {}
+
+            def __init_subclass__(cls, **kwargs):
+                Mixin.seen[cls.__name__] = kwargs
+                super().__init_subclass__()
+
+        class Cooperative(Version, Mixin, flag=1):
+            pass
+
+        self.assertEqual(Plain("1.2"), Version("1.2"))
+        self.assertIs(type(Plain("1.2")), Plain)
+        for call in (lambda: Plain(), lambda: Plain("1", "2"),
+                     lambda: Plain(version="1")):
+            with self.assertRaises(TypeError):
+                call()
+        value = WithInit("1.2", "x")
+        self.assertEqual((value, value.tag), (Version("1.2"), "x"))
+        self.assertEqual(WithNew("1.2"), Version("1.2"))
+        self.assertEqual(Mixin.seen, {"Cooperative": {"flag": 1}})
+        self.assertEqual(Cooperative("1.2"), Version("1.2"))
+
+        def late_init(self, text):
+            Version.__init__(self, text)
+            self.late = True
+
+        Plain.__init__ = late_init
+        self.assertTrue(Plain("1.2").late)
+        del Plain.__init__
+        self.assertFalse(hasattr(Plain("1.2"), "late"))
+
+    def test_hash_matches_across_storage(self):
+        # Five release components force full storage; the compact form
+        # of an equal value must hash the same.
+        for compact, full in [
+            ("1", "1.0.0.0.0"),
+            ("1.2a3", "1.2.0.0.0a3"),
+            ("1.0.dev1", "1.0.0.0.0.dev1"),
+            ("1.0.post2", "1.0.0.0.0.post2"),
+            ("1.0a0.post0.dev0", "1.0.0.0.0a0.post0.dev0"),
+            ("1.0.post1.dev2", "1.0.0.0.0.post1.dev2"),
+            ("65535.65535.65535.65535", "65535.65535.65535.65535.0"),
+        ]:
+            with self.subTest(compact=compact):
+                left, right = Version(compact), Version(full)
+                self.assertEqual(sys.getsizeof(left), sys.getsizeof(Version("1")))
+                self.assertGreater(sys.getsizeof(right), sys.getsizeof(left))
+                self.assertEqual(left, right)
+                self.assertEqual(hash(left), hash(right))
+                self.assertEqual(hash(left), hash(Version(compact)))
+        class Tagged(int):
+            pass
+        full = Version.from_parts(release=(Tagged(1), 2))
+        self.assertGreater(sys.getsizeof(full), sys.getsizeof(Version("1.2")))
+        self.assertEqual(hash(full), hash(Version("1.2")))
+
     def test_component_factories(self):
         value = Version.from_parts(
             epoch=2,

@@ -17,7 +17,7 @@
  *   | cached hash        |                 |   epoch, release,    |
  *   | release_len, ready |                 |   pre, post, dev,     |
  *   | value              |--- full ------->|   local              |
- *   | replacement        |                 | cached tuple key     |
+ *   | replacement        |                 | cached key and text  |
  *   +--------------------+                 +----------------------+
  *
  * After initialization, release_len selects the VersionValue union member:
@@ -48,8 +48,9 @@
  *   phase 2: no prerelease
  * post has a presence bit and 16-bit number.  dev holds a present number or
  * 0x1ffff for absence, which sorts after all present development numbers.
- * Compare high then low.  Hash the tuple key so equal compact and full values
- * have equal hashes.
+ * Compare high then low.  Full values hash their tuple key; compact values
+ * compute the same tuple hash from C integers, so equal values of either
+ * storage have equal hashes.
  *
  * Construction and reads
  * ======================
@@ -65,7 +66,9 @@
  * borrows spans from the input string, which stays owned until parsing ends.
  * Compact parsing creates no Python component objects.  Getters, formatting
  * and mixed comparisons unpack components as needed without changing storage.
- * Full values cache their tuple key; compact values cache only their hash.
+ * Full values cache their tuple key and their str().  When the public
+ * components fit, they also hold a packed key from construction, so most
+ * comparisons need no tuple key.  Compact values cache only their hash.
  * __replace__ chooses storage for a new value when components change.
  *
  * Initialization and ownership
@@ -73,13 +76,15 @@
  *
  * publish_version installs one complete value under the object lock, then
  * release-stores ready.  Readers acquire ready before reading the union.
+ * Objects created by the constructor paths are not yet shared, so
+ * publish_fresh skips the lock.
  * Empty objects have ready == 0 and own no full allocation, even though their
  * release_len is zero.  __sizeof__ must check ready too: another thread may
  * still be initializing an object exposed through object.__new__.
  *
  * Parsing and callbacks run outside publication locks.  Full-key construction
- * can call integer-subclass methods, so only the completed key is installed
- * under the cache lock.
+ * can call integer-subclass methods, so only the completed key is installed,
+ * with a compare-exchange.  A cached key or text never changes afterwards.
  *
  * Subtypes with __mutable_version__ = True can update through __setstate__:
  *
@@ -89,8 +94,8 @@
  * outside it.  Readers take an owned snapshot under the lock.  Original
  * storage stays unchanged.  GC visits the type, original full storage and
  * replacement; compact objects need tracking because their heap type can
- * participate in a cycle.  Module state owns the type, exception and shared
- * stable suffix per interpreter.
+ * participate in a cycle.  Module state owns the type, exception, shared
+ * stable suffix and prerelease letter strings per interpreter.
  */
 #ifndef Py_BUILD_CORE_BUILTIN
 #  define Py_BUILD_CORE_MODULE 1
@@ -99,6 +104,7 @@
 #include "Python.h"
 #include "pycore_call.h"          // _PyObject_MakeTpCall()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_tuple.h"         // _PyTuple_HASH_XXPRIME_1
 
 enum { PRE_A, PRE_B, PRE_RC, PRE_NONE = 0xff };
 /* SmallParts.flags */
@@ -136,6 +142,10 @@ typedef struct {
 typedef struct {
     PyObject *parts[PART_COUNT];
     PyObject *key;
+    PyObject *text;
+    /* Public components packed like a compact key, when they fit. */
+    VersionKey public_key;
+    uint8_t public_packed;
 } VersionFull;
 
 typedef union {
@@ -157,6 +167,7 @@ typedef struct {
     PyObject *version_type;
     PyObject *invalid_version;
     PyObject *stable_suffix;
+    PyObject *pre_names[3];
 } VersionState;
 
 typedef struct {
@@ -181,6 +192,8 @@ typedef struct {
     int has_epoch;
     NumberField epoch;
     Py_ssize_t rel_count;
+    /* Count without trailing zero components. */
+    Py_ssize_t rel_significant;
     const char *rel_span;
     Py_ssize_t rel_span_len;
     uint16_t rel_small[4];
@@ -422,6 +435,102 @@ unpack_small(const VersionObject *version)
     return parts;
 }
 
+/* Release count without trailing zeros, as the ordering key uses. */
+static Py_ssize_t
+small_trimmed_count(const SmallParts *parts)
+{
+    Py_ssize_t count = parts->release_count;
+    while (count > 0 && parts->release[count - 1] == 0) {
+        count--;
+    }
+    return count;
+}
+
+/* The suffix tuple of the comparison key: (rank, pre number, post present,
+ * post number, dev absent, dev number).  Rank orders dev-only (-1), a, b, rc
+ * (0-2) and final or post releases (3). */
+typedef struct {
+    int rank;
+    uint16_t pre_n;
+    int has_post;
+    uint16_t post_n;
+    int has_dev;
+    uint16_t dev_n;
+} SuffixKey;
+
+static SuffixKey
+small_suffix(const SmallParts *parts)
+{
+    int has_post = (parts->flags & HAS_POST) != 0;
+    int has_dev = (parts->flags & HAS_DEV) != 0;
+    SuffixKey suffix = {
+        .pre_n = parts->pre_n,
+        .has_post = has_post,
+        .post_n = parts->post_n,
+        .has_dev = has_dev,
+        .dev_n = parts->dev_n,
+    };
+    if (parts->pre_letter != PRE_NONE) {
+        suffix.rank = parts->pre_letter;
+    }
+    else {
+        suffix.rank = has_dev && !has_post ? -1 : 3;
+    }
+    return suffix;
+}
+
+/* Mirror tuple_hash() in Objects/tupleobject.c over already hashed lanes. */
+static Py_uhash_t
+hash_lanes(const Py_uhash_t *lanes, Py_ssize_t length)
+{
+    Py_uhash_t acc = _PyTuple_HASH_XXPRIME_5;
+    for (Py_ssize_t i = 0; i < length; i++) {
+        acc += lanes[i] * _PyTuple_HASH_XXPRIME_2;
+        acc = _PyTuple_HASH_XXROTATE(acc);
+        acc *= _PyTuple_HASH_XXPRIME_1;
+    }
+    acc += length ^ (_PyTuple_HASH_XXPRIME_5 ^ 3527539UL);
+    if (acc == (Py_uhash_t)-1) {
+        acc = 1546275796;
+    }
+    return acc;
+}
+
+/* Hash of the tuple key (0, trimmed release, suffix) without building it.
+ * Small nonnegative ints and bools hash to their value; hash(-1) is -2. */
+static Py_hash_t
+small_hash(const VersionObject *version)
+{
+    SmallParts parts = unpack_small(version);
+    SuffixKey suffix = small_suffix(&parts);
+    Py_uhash_t release[4];
+    Py_ssize_t count = small_trimmed_count(&parts);
+    for (Py_ssize_t i = 0; i < count; i++) {
+        release[i] = parts.release[i];
+    }
+    Py_uhash_t suffix_lanes[6] = {
+        suffix.rank == -1 ? (Py_uhash_t)-2 : (Py_uhash_t)suffix.rank,
+        suffix.pre_n,
+        suffix.has_post != 0,
+        suffix.post_n,
+        suffix.has_dev == 0,
+        suffix.dev_n,
+    };
+    Py_uhash_t lanes[3] = {0, hash_lanes(release, count),
+                           hash_lanes(suffix_lanes, 6)};
+    return (Py_hash_t)hash_lanes(lanes, 3);
+}
+
+/* Install the value into an object no other thread can see yet. */
+static void
+publish_fresh(VersionObject *target, uint8_t release_len, VersionValue value)
+{
+    target->release_len = release_len;
+    target->value = value;
+    target->hash = -1;
+    _Py_atomic_store_uint32_release(&target->ready, 1);
+}
+
 /* Ownership transfers only after all fields are ready for readers. */
 static int
 publish_version(VersionObject *target, uint8_t release_len, VersionValue value)
@@ -448,6 +557,7 @@ free_full(VersionFull *full)
 {
     clear_parts(full->parts);
     Py_XDECREF(full->key);
+    Py_XDECREF(full->text);
     PyMem_Free(full);
 }
 
@@ -459,8 +569,9 @@ clear_value(uint8_t release_len, VersionValue value)
     }
 }
 
+/* public_key is the packed public components, or NULL if they do not fit. */
 static VersionFull *
-full_from_parts(PyObject *const *parts)
+full_from_parts(PyObject *const *parts, const VersionKey *public_key)
 {
     VersionFull *full = PyMem_Calloc(1, sizeof(*full));
     if (full == NULL) {
@@ -470,19 +581,23 @@ full_from_parts(PyObject *const *parts)
     for (int i = 0; i < PART_COUNT; i++) {
         full->parts[i] = Py_NewRef(parts[i]);
     }
+    if (public_key != NULL) {
+        full->public_key = *public_key;
+        full->public_packed = 1;
+    }
     return full;
 }
 
-/* Takes ownership of value, including on allocation or publication failure. */
+/* Takes ownership of value, including on allocation failure. */
 static PyObject *
 version_from_value(PyTypeObject *type, uint8_t release_len, VersionValue value)
 {
     VersionObject *target = (VersionObject *)type->tp_alloc(type, 0);
-    if (target == NULL || publish_version(target, release_len, value) < 0) {
+    if (target == NULL) {
         clear_value(release_len, value);
-        Py_XDECREF(target);
         return NULL;
     }
+    publish_fresh(target, release_len, value);
     return (PyObject *)target;
 }
 
@@ -493,20 +608,34 @@ make_small_parts(PyTypeObject *type, const SmallParts *parts)
     return version_from_value(type, parts->release_count, value);
 }
 
+static int pack_public_key(PyObject *const *parts, VersionKey *key);
+
 static PyObject *
 make_full_parts(PyTypeObject *type, PyObject *const *parts)
 {
-    VersionValue value = {.full = full_from_parts(parts)};
+    VersionKey key;
+    VersionValue value = {
+        .full = full_from_parts(parts,
+                                pack_public_key(parts, &key) ? &key : NULL)};
     if (value.full == NULL) {
         return NULL;
     }
     return version_from_value(type, 0, value);
 }
 
-/* PyLong_FromString needs a terminated string; digit runs end mid-buffer. */
+/* Convert a validated ASCII digit run.  Runs of up to 18 digits fit in a
+ * long long; longer runs go through PyLong_FromString, which needs a
+ * terminated copy because digit runs end mid-buffer. */
 static PyObject *
 long_from(const char *s, Py_ssize_t len)
 {
+    if (len <= 18) {
+        long long value = 0;
+        for (Py_ssize_t i = 0; i < len; i++) {
+            value = value * 10 + (s[i] - '0');
+        }
+        return PyLong_FromLongLong(value);
+    }
     char stackbuf[32];
     char *buf = (len < (Py_ssize_t)sizeof(stackbuf)) ? stackbuf
                                                      : PyMem_Malloc(len + 1);
@@ -553,7 +682,12 @@ static Py_ssize_t
 read_digits(const char *p, const char *end, NumberField *f)
 {
     const char *start = p;
+    Py_ssize_t v = 0;
     while (p < end && Py_ISDIGIT(*p)) {
+        /* Stop accumulating once the value is too big for a compact field. */
+        if (v <= 0xffff) {
+            v = v * 10 + (*p - '0');
+        }
         p++;
     }
     Py_ssize_t n = p - start;
@@ -563,16 +697,8 @@ read_digits(const char *p, const char *end, NumberField *f)
     }
     f->s = start;
     f->len = n;
-    f->too_big = 0;
-    Py_ssize_t v = 0;
-    for (const char *q = start; q < p; q++) {
-        v = v * 10 + (*q - '0');
-        if (v > 0xffff) {
-            f->too_big = 1;
-            break;
-        }
-    }
     f->val = v;
+    f->too_big = v > 0xffff;
     return n;
 }
 
@@ -633,34 +759,24 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
         p++;
     }
 
-    /* epoch vs first release segment: digits then '!' => epoch */
-    {
-        const char *d = p;
-        while (d < end && Py_ISDIGIT(*d)) {
-            d++;
-        }
-        if (d > p && d < end && *d == '!') {
-            NumberField f;
-            read_digits(p, end, &f);
-            out->has_epoch = 1;
-            out->epoch = f;
-            p = d + 1;
-        }
+    /* The first digit run is the epoch when '!' follows, else it starts the
+     * release. */
+    NumberField f;
+    Py_ssize_t got = read_digits(p, end, &f);
+    if (got != 0 && p + got < end && p[got] == '!') {
+        out->has_epoch = 1;
+        out->epoch = f;
+        p += got + 1;
+        got = read_digits(p, end, &f);
+    }
+    if (got == 0) {
+        return -1;
     }
 
     /* release: [0-9]+ (. [0-9]+)* */
-    if (!(p < end && Py_ISDIGIT(*p))) {
-        return -1;
-    }
     out->rel_span = p;
     out->rel_all_small = 1;
-    out->rel_count = 0;
     for (;;) {
-        NumberField f;
-        Py_ssize_t got = read_digits(p, end, &f);
-        if (got == 0) {
-            return -1;
-        }
         if (out->rel_count < 4) {
             out->rel_small[out->rel_count] = (uint16_t)f.val;
         }
@@ -668,16 +784,16 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
             out->rel_all_small = 0;
         }
         out->rel_count++;
-        p += got;
-        if (p < end && *p == '.') {
-            /* lookahead: only consume '.' if a digit follows (else it may be
-               a pre/post/dev separator) */
-            if (p + 1 < end && Py_ISDIGIT(p[1])) {
-                p++;
-                continue;
-            }
+        if (f.val != 0) {
+            out->rel_significant = out->rel_count;
         }
-        break;
+        p += got;
+        /* A '.' without a following digit may start a pre/post/dev segment. */
+        if (!(p + 1 < end && *p == '.' && Py_ISDIGIT(p[1]))) {
+            break;
+        }
+        p++;
+        got = read_digits(p, end, &f);
     }
     out->rel_span_len = p - out->rel_span;
 
@@ -688,7 +804,6 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
         Py_ssize_t m;
         if (q < end && match_pre_letter(q, end, &letter, &m)) {
             q = skip_sep(q + m, end);
-            NumberField f;
             p = q + read_digits(q, end, &f);
             out->has_pre = 1;
             out->pre_letter = letter;
@@ -699,7 +814,6 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
     /* post: '-' N  |  [sep]? (post|rev|r) [sep]? [N]? */
     if (p + 1 < end && *p == '-' && Py_ISDIGIT(p[1])) {
         p++;
-        NumberField f;
         p += read_digits(p, end, &f);
         out->has_post = 1;
         out->post_n = f;
@@ -715,7 +829,6 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
         }
         if (m) {
             q = skip_sep(q + m, end);
-            NumberField f;
             p = q + read_digits(q, end, &f);
             out->has_post = 1;
             out->post_n = f;
@@ -728,7 +841,6 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
         Py_ssize_t m = match_kw(q, end, "dev");
         if (m) {
             q = skip_sep(q + m, end);
-            NumberField f;
             p = q + read_digits(q, end, &f);
             out->has_dev = 1;
             out->dev_n = f;
@@ -818,15 +930,31 @@ normalize_local(PyObject *value, PyTypeObject *type)
     return NULL;
 }
 
+/* (letter, number) with the shared letter string; borrows number. */
+static PyObject *
+make_pre(PyTypeObject *type, int letter, PyObject *number)
+{
+    VersionState *state = state_from_type(type);
+    if (state == NULL) {
+        return NULL;
+    }
+    return PyTuple_Pack(2, state->pre_names[letter], number);
+}
+
+static PyObject *
+number_or_zero(const NumberField *field)
+{
+    return field->len ? long_from(field->s, field->len) : PyLong_FromLong(0);
+}
+
 static int
-parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
+parts_from_parsed(PyTypeObject *type, const ParsedVersion *parsed,
+                  PyObject **parts)
 {
     for (int i = 0; i < PART_COUNT; i++) {
         parts[i] = Py_NewRef(Py_None);
     }
-    Py_SETREF(parts[PART_EPOCH],
-              parsed->has_epoch ? long_from(parsed->epoch.s, parsed->epoch.len)
-                                : PyLong_FromLong(0));
+    Py_SETREF(parts[PART_EPOCH], number_or_zero(&parsed->epoch));
     if (parts[PART_EPOCH] == NULL) {
         return -1;
     }
@@ -852,33 +980,25 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
         return -1;
     }
     if (parsed->has_pre) {
-        PyObject *number = parsed->pre_n.len
-                               ? long_from(parsed->pre_n.s, parsed->pre_n.len)
-                               : PyLong_FromLong(0);
+        PyObject *number = number_or_zero(&parsed->pre_n);
         if (number == NULL) {
             return -1;
         }
-        Py_SETREF(
-            parts[PART_PRE],
-            Py_BuildValue("(sN)", PRE_NAMES[parsed->pre_letter], number));
+        Py_SETREF(parts[PART_PRE],
+                  make_pre(type, parsed->pre_letter, number));
+        Py_DECREF(number);
         if (parts[PART_PRE] == NULL) {
             return -1;
         }
     }
     if (parsed->has_post) {
-        Py_SETREF(parts[PART_POST],
-                  parsed->post_n.len
-                      ? long_from(parsed->post_n.s, parsed->post_n.len)
-                      : PyLong_FromLong(0));
+        Py_SETREF(parts[PART_POST], number_or_zero(&parsed->post_n));
         if (parts[PART_POST] == NULL) {
             return -1;
         }
     }
     if (parsed->has_dev) {
-        Py_SETREF(parts[PART_DEV],
-                  parsed->dev_n.len
-                      ? long_from(parsed->dev_n.s, parsed->dev_n.len)
-                      : PyLong_FromLong(0));
+        Py_SETREF(parts[PART_DEV], number_or_zero(&parsed->dev_n));
         if (parts[PART_DEV] == NULL) {
             return -1;
         }
@@ -893,10 +1013,11 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
     return 0;
 }
 
+/* Parse text into an unpublished value; the caller owns the result. */
 static int
-parse_into_version(VersionObject *target, PyObject *original)
+parse_value(PyTypeObject *type, PyObject *original, uint8_t *release_len_out,
+            VersionValue *value_out)
 {
-    PyTypeObject *type = Py_TYPE(target);
     PyObject *text = NULL;
     if (!PyUnicode_Check(original)) {
         goto invalid;
@@ -928,18 +1049,18 @@ parse_into_version(VersionObject *target, PyObject *original)
     if (parse_version(data, length, &parsed) < 0) {
         goto invalid;
     }
-    int small = (!parsed.has_epoch ||
+    /* The public components fit a compact key.  Trailing release zeros do
+     * not change the key, so only the significant components must fit. */
+    int packs = (!parsed.has_epoch ||
                  (!parsed.epoch.too_big && parsed.epoch.val == 0)) &&
-                !parsed.has_local && parsed.rel_count <= 4 &&
-                parsed.rel_all_small &&
+                parsed.rel_significant <= 4 && parsed.rel_all_small &&
                 (!parsed.has_pre || !parsed.pre_n.too_big) &&
                 (!parsed.has_post || !parsed.post_n.too_big) &&
                 (!parsed.has_dev || !parsed.dev_n.too_big);
-    VersionValue value = {0};
-    uint8_t release_len = 0;
-    if (small) {
+    VersionKey key = {0};
+    if (packs) {
         SmallParts parts = {
-            .release_count = (uint8_t)parsed.rel_count,
+            .release_count = (uint8_t)Py_MIN(parsed.rel_count, 4),
             .pre_letter = parsed.has_pre ? parsed.pre_letter : PRE_NONE,
             .pre_n = parsed.has_pre ? (uint16_t)parsed.pre_n.val : 0,
             .post_n = parsed.has_post ? (uint16_t)parsed.post_n.val : 0,
@@ -948,17 +1069,22 @@ parse_into_version(VersionObject *target, PyObject *original)
                      (parsed.has_dev ? HAS_DEV : 0),
         };
         memcpy(parts.release, parsed.rel_small, sizeof(parts.release));
-        value.key = pack_small_key(&parts);
-        release_len = parts.release_count;
+        key = pack_small_key(&parts);
+    }
+    VersionValue value = {0};
+    uint8_t release_len = 0;
+    if (packs && !parsed.has_local && parsed.rel_count <= 4) {
+        value.key = key;
+        release_len = (uint8_t)parsed.rel_count;
     }
     else {
         PyObject *parts[PART_COUNT] = {0};
-        if (parts_from_parsed(&parsed, parts) < 0) {
+        if (parts_from_parsed(type, &parsed, parts) < 0) {
             clear_parts(parts);
             Py_DECREF(text);
             return -1;
         }
-        value.full = full_from_parts(parts);
+        value.full = full_from_parts(parts, packs ? &key : NULL);
         clear_parts(parts);
         if (value.full == NULL) {
             Py_DECREF(text);
@@ -966,16 +1092,29 @@ parse_into_version(VersionObject *target, PyObject *original)
         }
     }
     Py_DECREF(text);
-    if (publish_version(target, release_len, value) < 0) {
-        clear_value(release_len, value);
-        return -1;
-    }
+    *release_len_out = release_len;
+    *value_out = value;
     return 0;
 
 invalid:
     Py_XDECREF(text);
     format_invalid_version(type, "Invalid version: %R", original);
     return -1;
+}
+
+static int
+parse_into_version(VersionObject *target, PyObject *original)
+{
+    uint8_t release_len;
+    VersionValue value;
+    if (parse_value(Py_TYPE(target), original, &release_len, &value) < 0) {
+        return -1;
+    }
+    if (publish_version(target, release_len, value) < 0) {
+        clear_value(release_len, value);
+        return -1;
+    }
+    return 0;
 }
 
 /* Match pickle's default dictionary and slot restoration for subclasses. */
@@ -1033,7 +1172,9 @@ restore_value_once(PyObject *self, PyObject *created)
     uint8_t release_len = source->release_len;
     VersionValue value = source->value;
     if (release_len == 0) {
-        value.full = full_from_parts(source->value.full->parts);
+        const VersionFull *full = source->value.full;
+        value.full = full_from_parts(
+            full->parts, full->public_packed ? &full->public_key : NULL);
         if (value.full == NULL) {
             return NULL;
         }
@@ -1126,28 +1267,59 @@ version_init(PyObject *self, PyObject *args, PyObject *keywords)
     return parse_into_version(version_cast(self), text);
 }
 
-/* Version(text) skips tuple packing and format parsing.  Other call shapes
- * take tp_call, so version_init reports their errors.  Subclasses do not
- * inherit this slot. */
+/* Version(text) skips tuple packing and format parsing.  Other call shapes,
+ * and types with their own __new__ or __init__, take tp_call so that those
+ * methods run and version_init reports argument errors.  The slot check
+ * happens on every call because __init__ can be assigned after class
+ * creation. */
 static PyObject *
 version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
                    PyObject *kwnames)
 {
     Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0)) {
+    PyTypeObject *version_type = (PyTypeObject *)type;
+    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0) ||
+        version_type->tp_init != version_init ||
+        version_type->tp_new != PyBaseObject_Type.tp_new) {
         return _PyObject_MakeTpCall(_PyThreadState_GET(), type, args, nargs,
                                     kwnames);
     }
-    PyTypeObject *version_type = (PyTypeObject *)type;
-    PyObject *target = version_type->tp_alloc(version_type, 0);
-    if (target == NULL) {
+    uint8_t release_len;
+    VersionValue value;
+    if (parse_value((PyTypeObject *)type, args[0], &release_len, &value) < 0) {
         return NULL;
     }
-    if (parse_into_version(version_cast(target), args[0]) < 0) {
-        Py_DECREF(target);
+    return version_from_value((PyTypeObject *)type, release_len, value);
+}
+
+/* Subclasses do not inherit tp_vectorcall; install it from
+ * __init_subclass__ after calling the next one in the MRO. */
+static PyObject *
+version_init_subclass(PyObject *cls, PyObject *const *args, Py_ssize_t nargs,
+                      PyObject *kwnames)
+{
+    VersionState *state = state_from_type((PyTypeObject *)cls);
+    if (state == NULL) {
         return NULL;
     }
-    return target;
+    PyObject *super_args[2] = {state->version_type, cls};
+    PyObject *super = PyObject_Vectorcall((PyObject *)&PySuper_Type,
+                                          super_args, 2, NULL);
+    if (super == NULL) {
+        return NULL;
+    }
+    PyObject *next = PyObject_GetAttrString(super, "__init_subclass__");
+    Py_DECREF(super);
+    if (next == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyObject_Vectorcall(next, args, nargs, kwnames);
+    Py_DECREF(next);
+    if (result == NULL) {
+        return NULL;
+    }
+    ((PyTypeObject *)cls)->tp_vectorcall = version_vectorcall;
+    return result;
 }
 
 static int
@@ -1229,7 +1401,7 @@ normalize_part(int index, PyObject *value, PyTypeObject *type)
                         return NULL;
                     }
                     if (valid) {
-                        return Py_BuildValue("(sO)", PRE_NAMES[kind], number);
+                        return make_pre(type, kind, number);
                     }
                 }
             }
@@ -1279,9 +1451,10 @@ small_number(PyObject *value, uint16_t *result)
 }
 
 /* Apply the given normalized parts to small; NULL parts keep their value.
- * Return 0 if a part needs full storage. */
+ * Return 0 if a part needs full storage.  trim_release drops trailing
+ * release zeros first, as the ordering key does. */
 static int
-apply_small_parts(SmallParts *small, PyObject *const *parts)
+apply_small_parts(SmallParts *small, PyObject *const *parts, int trim_release)
 {
     if (parts[PART_EPOCH] && (!PyLong_CheckExact(parts[PART_EPOCH]) ||
                               !PyLong_IsZero(parts[PART_EPOCH]))) {
@@ -1293,6 +1466,13 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
     if (parts[PART_RELEASE]) {
         PyObject *release = parts[PART_RELEASE];
         Py_ssize_t count = PyTuple_GET_SIZE(release);
+        while (trim_release && count > 0) {
+            PyObject *last = PyTuple_GET_ITEM(release, count - 1);
+            if (!PyLong_CheckExact(last) || !PyLong_IsZero(last)) {
+                break;
+            }
+            count--;
+        }
         if (count > 4) {
             return 0;
         }
@@ -1333,11 +1513,26 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
     return 1;
 }
 
+/* Pack the public components of full storage when they fit a compact key. */
+static int
+pack_public_key(PyObject *const *parts, VersionKey *key)
+{
+    PyObject *public_parts[PART_COUNT];
+    memcpy(public_parts, parts, sizeof(public_parts));
+    public_parts[PART_LOCAL] = NULL;
+    SmallParts small = {0};
+    if (!apply_small_parts(&small, public_parts, 1)) {
+        return 0;
+    }
+    *key = pack_small_key(&small);
+    return 1;
+}
+
 static PyObject *
 make_parts(PyTypeObject *type, PyObject *const *parts)
 {
     SmallParts small = {0};
-    if (apply_small_parts(&small, parts)) {
+    if (apply_small_parts(&small, parts, 0)) {
         return make_small_parts(type, &small);
     }
     return make_full_parts(type, parts);
@@ -1422,8 +1617,13 @@ get_pre_impl(PyObject *self, void *Py_UNUSED(context))
     if (parts.pre_letter == PRE_NONE) {
         Py_RETURN_NONE;
     }
-    return Py_BuildValue("(sI)", PRE_NAMES[parts.pre_letter],
-                         (unsigned int)parts.pre_n);
+    PyObject *number = PyLong_FromLong(parts.pre_n);
+    if (number == NULL) {
+        return NULL;
+    }
+    PyObject *result = make_pre(Py_TYPE(self), parts.pre_letter, number);
+    Py_DECREF(number);
+    return result;
 }
 
 static PyObject *
@@ -1609,17 +1809,22 @@ format_small_version(const VersionObject *version, int mode)
             output = write_small_number(output + 4, parts.dev_n);
         }
     }
-    return PyUnicode_FromStringAndSize(buffer, output - buffer);
+    /* The buffer is ASCII, so skip the UTF-8 decoder.  Single characters
+     * come from the interpreter's shared cache. */
+    Py_ssize_t length = output - buffer;
+    if (length == 1) {
+        return PyUnicode_FromOrdinal(buffer[0]);
+    }
+    PyObject *text = PyUnicode_New(length, 127);
+    if (text != NULL) {
+        memcpy(PyUnicode_1BYTE_DATA(text), buffer, (size_t)length);
+    }
+    return text;
 }
 
 static PyObject *
-format_version(PyObject *self, int mode)
+format_full_version(const VersionObject *version, int mode)
 {
-    VersionObject *version = version_cast(self);
-    if (is_small(version)) {
-        return format_small_version(version, mode);
-    }
-
     PyObject **parts = version->value.full->parts;
     PyUnicodeWriter *writer = PyUnicodeWriter_Create(0);
     if (writer == NULL) {
@@ -1668,6 +1873,42 @@ format_version(PyObject *self, int mode)
 error:
     PyUnicodeWriter_Discard(writer);
     return NULL;
+}
+
+/* Set an empty cache slot to created, or drop created if another thread set
+ * the slot first.  Return a new reference to the slot's value.  A set slot
+ * keeps its value until the owner is cleared, so readers need no lock. */
+static PyObject *
+install_cached(PyObject **cache, PyObject *created)
+{
+    if (created == NULL) {
+        return NULL;
+    }
+    PyObject *existing = NULL;
+    if (_Py_atomic_compare_exchange_ptr(cache, &existing, created)) {
+        return Py_NewRef(created);
+    }
+    Py_DECREF(created);
+    return Py_NewRef(existing);
+}
+
+static PyObject *
+format_version(PyObject *self, int mode)
+{
+    VersionObject *version = version_cast(self);
+    if (is_small(version)) {
+        return format_small_version(version, mode);
+    }
+    if (mode != FORMAT_ALL) {
+        return format_full_version(version, mode);
+    }
+    PyObject **cache = &version->value.full->text;
+    PyObject *text = _Py_atomic_load_ptr_acquire(cache);
+    if (text != NULL) {
+        return Py_NewRef(text);
+    }
+    /* Component __str__ methods can run; store only a finished result. */
+    return install_cached(cache, format_full_version(version, FORMAT_ALL));
 }
 
 static PyObject *
@@ -1843,7 +2084,7 @@ replace_parts(PyObject *self, PyObject *const *arguments,
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
         SmallParts small = unpack_small(version);
-        if (apply_small_parts(&small, parts)) {
+        if (apply_small_parts(&small, parts, 0)) {
             VersionKey key = pack_small_key(&small);
             int unchanged = small.release_count == version->release_len &&
                             key.high == version->value.key.high &&
@@ -2011,27 +2252,60 @@ done:
     return result;
 }
 
+/* Same shape as build_cmpkey, from the packed fields. */
+static PyObject *
+build_small_cmpkey(PyTypeObject *type, const VersionObject *version)
+{
+    SmallParts parts = unpack_small(version);
+    SuffixKey suffix = small_suffix(&parts);
+    TupleBuilder builder;
+    if (tuple_builder_init(&builder, small_trimmed_count(&parts)) < 0) {
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < builder.length; i++) {
+        builder.items[i] = PyLong_FromLong(parts.release[i]);
+        if (builder.items[i] == NULL) {
+            tuple_builder_clear(&builder);
+            return NULL;
+        }
+    }
+    PyObject *release = tuple_builder_finish(&builder);
+    if (release == NULL) {
+        return NULL;
+    }
+    PyObject *suffix_key;
+    if (suffix.rank == 3 && !suffix.has_post && !suffix.has_dev) {
+        VersionState *state = state_from_type(type);
+        suffix_key = state == NULL ? NULL : Py_NewRef(state->stable_suffix);
+    }
+    else {
+        suffix_key = Py_BuildValue("(iIiIiI)", suffix.rank,
+                                   (unsigned int)suffix.pre_n, suffix.has_post,
+                                   (unsigned int)suffix.post_n, !suffix.has_dev,
+                                   (unsigned int)suffix.dev_n);
+    }
+    PyObject *result = NULL;
+    if (suffix_key != NULL) {
+        result = PyTuple_Pack(3, Py_GetConstantBorrowed(Py_CONSTANT_ZERO),
+                              release, suffix_key);
+    }
+    Py_DECREF(release);
+    Py_XDECREF(suffix_key);
+    return result;
+}
+
 static PyObject *
 get_cmpkey(PyObject *self)
 {
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
-        PyObject *parts[PART_COUNT] = {0};
-        if (parts_from_version(self, parts) < 0) {
-            clear_parts(parts);
-            return NULL;
-        }
-        PyObject *key = build_cmpkey(Py_TYPE(self), parts);
-        clear_parts(parts);
-        return key;
+        return build_small_cmpkey(Py_TYPE(self), version);
     }
 
-    PyObject *key;
-    Py_BEGIN_CRITICAL_SECTION(self);
-    key = Py_XNewRef(version->value.full->key);
-    Py_END_CRITICAL_SECTION();
+    PyObject **cache = &version->value.full->key;
+    PyObject *key = _Py_atomic_load_ptr_acquire(cache);
     if (key != NULL) {
-        return key;
+        return Py_NewRef(key);
     }
     if (Py_EnterRecursiveCall(" while building a version comparison key")) {
         return NULL;
@@ -2039,34 +2313,52 @@ get_cmpkey(PyObject *self)
     PyObject *created =
         build_cmpkey(Py_TYPE(self), version->value.full->parts);
     Py_LeaveRecursiveCall();
-    if (created == NULL) {
-        return NULL;
-    }
     /* Building may invoke an int subclass; publish only after it completes. */
-    Py_BEGIN_CRITICAL_SECTION(self);
-    if (version->value.full->key == NULL) {
-        version->value.full->key = Py_NewRef(created);
+    return install_cached(cache, created);
+}
+
+static int
+compare_keys(VersionKey a, VersionKey b)
+{
+    return a.high < b.high   ? -1
+           : a.high > b.high ? 1
+           : a.low < b.low   ? -1
+           : a.low > b.low   ? 1
+                             : 0;
+}
+
+/* Fill key and has_local when the public components pack. */
+static inline int
+packed_key(PyObject *self, VersionKey *key, int *has_local)
+{
+    const VersionObject *version = version_cast(self);
+    if (is_small(version)) {
+        *key = version->value.key;
+        *has_local = 0;
+        return 1;
     }
-    key = Py_NewRef(version->value.full->key);
-    Py_END_CRITICAL_SECTION();
-    Py_DECREF(created);
-    return key;
+    const VersionFull *full = version->value.full;
+    *key = full->public_key;
+    *has_local = full->parts[PART_LOCAL] != Py_None;
+    return full->public_packed;
 }
 
 static PyObject *
 compare_current_versions(PyObject *self, PyObject *other, int op)
 {
-    VersionObject *left = version_cast(self);
-    VersionObject *right = version_cast(other);
-    if (is_small(left) && is_small(right)) {
-        VersionKey a = left->value.key;
-        VersionKey b = right->value.key;
-        int comparison = a.high < b.high   ? -1
-                         : a.high > b.high ? 1
-                         : a.low < b.low   ? -1
-                         : a.low > b.low   ? 1
-                                           : 0;
-        Py_RETURN_RICHCOMPARE(comparison, 0, op);
+    VersionKey left, right;
+    int left_local, right_local;
+    if (packed_key(self, &left, &left_local) &&
+        packed_key(other, &right, &right_local)) {
+        int comparison = compare_keys(left, right);
+        if (comparison == 0) {
+            /* A local label sorts after the same public version. */
+            comparison = left_local - right_local;
+        }
+        /* Only two local labels on equal public versions need tuple keys. */
+        if (comparison != 0 || !left_local) {
+            Py_RETURN_RICHCOMPARE(comparison, 0, op);
+        }
     }
     PyObject *a = get_cmpkey(self);
     if (a == NULL) {
@@ -2117,14 +2409,19 @@ version_hash(PyObject *self)
     if (hash != -1) {
         return hash;
     }
-    PyObject *key = get_cmpkey(self);
-    if (key == NULL) {
-        return -1;
+    if (is_small(version)) {
+        hash = small_hash(version);
     }
-    hash = PyObject_Hash(key);
-    Py_DECREF(key);
-    if (hash == -1) {
-        return -1;
+    else {
+        PyObject *key = get_cmpkey(self);
+        if (key == NULL) {
+            return -1;
+        }
+        hash = PyObject_Hash(key);
+        Py_DECREF(key);
+        if (hash == -1) {
+            return -1;
+        }
     }
     Py_hash_t expected = -1;
     _Py_atomic_compare_exchange_ssize(&version->hash, &expected, hash);
@@ -2176,6 +2473,11 @@ static PyMethodDef version_methods[] = {
      "__setstate__($self, state, /)\n"
      "--\n\n"
      "Restore an empty value or subclass attributes."},
+    {"__init_subclass__", (PyCFunction)(void (*)(void))version_init_subclass,
+     METH_FASTCALL | METH_KEYWORDS | METH_CLASS,
+     "__init_subclass__($type, /, *args, **kwargs)\n"
+     "--\n\n"
+     "Give the subclass the constructor fast path."},
     {NULL, NULL, 0, NULL},
 };
 
@@ -2221,6 +2523,7 @@ version_traverse(PyObject *self, visitproc visit, void *arg)
             Py_VISIT(version->value.full->parts[i]);
         }
         Py_VISIT(version->value.full->key);
+        Py_VISIT(version->value.full->text);
     }
     return 0;
 }
@@ -2288,6 +2591,12 @@ version_exec(PyObject *module)
                               state->invalid_version) < 0) {
         return -1;
     }
+    for (int i = 0; i < 3; i++) {
+        state->pre_names[i] = PyUnicode_InternFromString(PRE_NAMES[i]);
+        if (state->pre_names[i] == NULL) {
+            return -1;
+        }
+    }
     state->stable_suffix = Py_BuildValue("(iiiiii)", 3, 0, 0, 0, 1, 0);
     if (state->stable_suffix == NULL) {
         return -1;
@@ -2317,6 +2626,9 @@ module_traverse(PyObject *module, visitproc visit, void *arg)
     Py_VISIT(state->version_type);
     Py_VISIT(state->invalid_version);
     Py_VISIT(state->stable_suffix);
+    for (int i = 0; i < 3; i++) {
+        Py_VISIT(state->pre_names[i]);
+    }
     return 0;
 }
 
@@ -2327,6 +2639,9 @@ module_clear(PyObject *module)
     Py_CLEAR(state->version_type);
     Py_CLEAR(state->invalid_version);
     Py_CLEAR(state->stable_suffix);
+    for (int i = 0; i < 3; i++) {
+        Py_CLEAR(state->pre_names[i]);
+    }
     return 0;
 }
 
