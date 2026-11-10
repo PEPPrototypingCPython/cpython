@@ -347,10 +347,14 @@ class VersionTests(unittest.TestCase):
                 self.assertEqual(str(value), text)
         with self.assertRaises(TypeError):
             Version()
+        self.assertEqual(Version(version="1"), Version("1"))
+        value = object.__new__(Version)
+        value.__init__(version="1")
+        self.assertEqual(value, Version("1"))
         with self.assertRaises(TypeError):
-            Version(version="1")
+            Version("1", version="1")
         with self.assertRaises(TypeError):
-            object.__new__(Version).__init__(version="1")
+            Version(text="1")
 
     def test_failed_initialization_can_be_retried(self):
         value = object.__new__(Version)
