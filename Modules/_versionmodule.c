@@ -92,14 +92,20 @@
  * participate in a cycle.  Module state owns the type, exception and shared
  * stable suffix per interpreter.
  */
-#define PY_SSIZE_T_CLEAN
-#include "Python.h"
+#ifndef Py_BUILD_CORE_BUILTIN
+#  define Py_BUILD_CORE_MODULE 1
+#endif
 
-#include <stdarg.h>
-#include <stdint.h>
-#include <string.h>
+#include "Python.h"
+#include "pycore_call.h"          // _PyObject_MakeTpCall()
+#include "pycore_pystate.h"       // _PyThreadState_GET()
 
 enum { PRE_A, PRE_B, PRE_RC, PRE_NONE = 0xff };
+/* SmallParts.flags */
+enum { HAS_POST = 1, HAS_DEV = 2 };
+/* Compact key fields; see the layout above. */
+enum { PHASE_DEV_ONLY, PHASE_PRE, PHASE_NONE };
+#define DEV_ABSENT 0x1ffffu
 enum {
     PART_EPOCH,
     PART_RELEASE,
@@ -111,6 +117,14 @@ enum {
 };
 
 static const char *const PRE_NAMES[] = {"a", "b", "rc"};
+/* Longer spellings first so "pre" does not shadow "preview". */
+static const struct {
+    const char *word;
+    uint8_t letter;
+} PRE_WORDS[] = {
+    {"alpha", PRE_A}, {"beta", PRE_B}, {"preview", PRE_RC}, {"pre", PRE_RC},
+    {"rc", PRE_RC},   {"a", PRE_A},    {"b", PRE_B},        {"c", PRE_RC},
+};
 static const char *const PART_NAMES[] = {"epoch", "release", "pre",
                                          "post",  "dev",     "local"};
 
@@ -155,12 +169,12 @@ typedef struct {
     uint8_t flags;
 } SmallParts;
 
+/* len == 0 means the number was absent. */
 typedef struct {
     const char *s;
     Py_ssize_t len;
     Py_ssize_t val;
     int too_big;
-    int present;
 } NumberField;
 
 typedef struct {
@@ -184,6 +198,14 @@ typedef struct {
 } ParsedVersion;
 
 static struct PyModuleDef version_module;
+
+/*[clinic input]
+module _version
+class _version.Version "PyObject *" "clinic_state()->version_type"
+[clinic start generated code]*/
+/*[clinic end generated code: output=da39a3ee5e6b4b0d input=abb758212f42d273]*/
+
+#include "clinic/_versionmodule.c.h"
 
 static inline VersionObject *
 version_cast(PyObject *object)
@@ -224,6 +246,15 @@ version_current(PyObject *self)
     current = Py_NewRef(version->replacement);
     Py_END_CRITICAL_SECTION();
     return current;
+}
+
+/* Release what version_current returned. */
+static inline void
+release_current(PyObject *self, PyObject *current)
+{
+    if (current != self) {
+        Py_DECREF(current);
+    }
 }
 
 #define DELEGATE_VERSION(self, result_type, call, error) \
@@ -336,30 +367,6 @@ tuple_builder_finish(TupleBuilder *builder)
     return tuple;
 }
 
-static inline uint32_t
-small_pre(const VersionObject *version)
-{
-    return (uint32_t)((version->value.key.low >> 34) & 0xfffff);
-}
-
-static inline uint32_t
-small_post(const VersionObject *version)
-{
-    return (uint32_t)((version->value.key.low >> 17) & 0x1ffff);
-}
-
-static inline uint32_t
-small_dev(const VersionObject *version)
-{
-    return (uint32_t)(version->value.key.low & 0x1ffff);
-}
-
-static inline uint64_t
-small_release(const VersionObject *version)
-{
-    return version->value.key.high;
-}
-
 static VersionKey
 pack_small_key(const SmallParts *parts)
 {
@@ -367,18 +374,21 @@ pack_small_key(const SmallParts *parts)
     for (int i = 0; i < parts->release_count; i++) {
         release |= (uint64_t)parts->release[i] << (48 - 16 * i);
     }
+    int has_post = parts->flags & HAS_POST;
+    int has_dev = parts->flags & HAS_DEV;
     uint32_t pre;
     if (parts->pre_letter != PRE_NONE) {
-        pre = (1u << 18) | ((uint32_t)parts->pre_letter << 16) | parts->pre_n;
+        pre = ((uint32_t)PHASE_PRE << 18) |
+              ((uint32_t)parts->pre_letter << 16) | parts->pre_n;
     }
-    else if ((parts->flags & 2) && !(parts->flags & 1)) {
-        pre = 0;
+    else if (has_dev && !has_post) {
+        pre = (uint32_t)PHASE_DEV_ONLY << 18;
     }
     else {
-        pre = 2u << 18;
+        pre = (uint32_t)PHASE_NONE << 18;
     }
-    uint32_t post = (parts->flags & 1) ? (1u << 16) | parts->post_n : 0;
-    uint32_t dev = (parts->flags & 2) ? parts->dev_n : 0x1ffff;
+    uint32_t post = has_post ? (1u << 16) | parts->post_n : 0;
+    uint32_t dev = has_dev ? parts->dev_n : DEV_ABSENT;
     /* Two uint64_t words avoid a compiler-specific 128-bit integer type. */
     return (VersionKey){
         .high = release,
@@ -390,17 +400,21 @@ pack_small_key(const SmallParts *parts)
 static SmallParts
 unpack_small(const VersionObject *version)
 {
-    uint64_t release = small_release(version);
-    uint32_t pre = small_pre(version);
-    uint32_t post = small_post(version);
-    uint32_t dev = small_dev(version);
+    uint64_t release = version->value.key.high;
+    uint64_t low = version->value.key.low;
+    uint32_t pre = (uint32_t)((low >> 34) & 0xfffff);
+    uint32_t post = (uint32_t)((low >> 17) & 0x1ffff);
+    uint32_t dev = (uint32_t)(low & 0x1ffff);
+    int has_pre = (pre >> 18) == PHASE_PRE;
+    int has_post = post >> 16;
+    int has_dev = dev != DEV_ABSENT;
     SmallParts parts = {
         .release_count = version->release_len,
-        .pre_letter = (pre >> 18) == 1 ? (pre >> 16) & 3 : PRE_NONE,
-        .pre_n = (pre >> 18) == 1 ? pre & UINT16_MAX : 0,
-        .post_n = (post >> 16) ? post & UINT16_MAX : 0,
-        .dev_n = dev != 0x1ffff ? dev : 0,
-        .flags = ((post >> 16) ? 1 : 0) | (dev != 0x1ffff ? 2 : 0),
+        .pre_letter = has_pre ? (pre >> 16) & 3 : PRE_NONE,
+        .pre_n = has_pre ? pre & UINT16_MAX : 0,
+        .post_n = has_post ? post & UINT16_MAX : 0,
+        .dev_n = has_dev ? dev : 0,
+        .flags = (has_post ? HAS_POST : 0) | (has_dev ? HAS_DEV : 0),
     };
     for (int i = 0; i < parts.release_count; i++) {
         parts.release[i] = (uint16_t)(release >> (48 - 16 * i));
@@ -430,12 +444,18 @@ publish_version(VersionObject *target, uint8_t release_len, VersionValue value)
 }
 
 static void
+free_full(VersionFull *full)
+{
+    clear_parts(full->parts);
+    Py_XDECREF(full->key);
+    PyMem_Free(full);
+}
+
+static void
 clear_value(uint8_t release_len, VersionValue value)
 {
     if (release_len == 0 && value.full != NULL) {
-        clear_parts(value.full->parts);
-        Py_XDECREF(value.full->key);
-        PyMem_Free(value.full);
+        free_full(value.full);
     }
 }
 
@@ -483,6 +503,7 @@ make_full_parts(PyTypeObject *type, PyObject *const *parts)
     return version_from_value(type, 0, value);
 }
 
+/* PyLong_FromString needs a terminated string; digit runs end mid-buffer. */
 static PyObject *
 long_from(const char *s, Py_ssize_t len)
 {
@@ -507,13 +528,10 @@ is_sep(char c)
     return c == '.' || c == '-' || c == '_';
 }
 
-static int
-lc(char c)
+static const char *
+skip_sep(const char *p, const char *end)
 {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A' + 'a';
-    }
-    return c;
+    return p < end && is_sep(*p) ? p + 1 : p;
 }
 
 /* case-insensitive match of kw at p; return length matched or 0 */
@@ -522,7 +540,7 @@ match_kw(const char *p, const char *end, const char *kw)
 {
     Py_ssize_t i = 0;
     while (kw[i]) {
-        if (p + i >= end || lc(p[i]) != kw[i]) {
+        if (p + i >= end || Py_TOLOWER(p[i]) != kw[i]) {
             return 0;
         }
         i++;
@@ -535,7 +553,7 @@ static Py_ssize_t
 read_digits(const char *p, const char *end, NumberField *f)
 {
     const char *start = p;
-    while (p < end && *p >= '0' && *p <= '9') {
+    while (p < end && Py_ISDIGIT(*p)) {
         p++;
     }
     Py_ssize_t n = p - start;
@@ -543,20 +561,16 @@ read_digits(const char *p, const char *end, NumberField *f)
         memset(f, 0, sizeof(*f));
         return 0;
     }
-    f->present = 1;
     f->s = start;
     f->len = n;
     f->too_big = 0;
     Py_ssize_t v = 0;
     for (const char *q = start; q < p; q++) {
+        v = v * 10 + (*q - '0');
         if (v > 0xffff) {
             f->too_big = 1;
             break;
         }
-        v = v * 10 + (*q - '0');
-    }
-    if (v > 0xffff) {
-        f->too_big = 1;
     }
     f->val = v;
     return n;
@@ -565,48 +579,46 @@ read_digits(const char *p, const char *end, NumberField *f)
 static int
 match_pre_letter(const char *p, const char *end, int *letter, Py_ssize_t *mlen)
 {
-    Py_ssize_t m;
-    if ((m = match_kw(p, end, "alpha"))) {
-        *letter = PRE_A;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "beta"))) {
-        *letter = PRE_B;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "preview"))) {
-        *letter = PRE_RC;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "pre"))) {
-        *letter = PRE_RC;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "rc"))) {
-        *letter = PRE_RC;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "a"))) {
-        *letter = PRE_A;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "b"))) {
-        *letter = PRE_B;
-        *mlen = m;
-        return 1;
-    }
-    if ((m = match_kw(p, end, "c"))) {
-        *letter = PRE_RC;
-        *mlen = m;
-        return 1;
+    for (size_t i = 0; i < Py_ARRAY_LENGTH(PRE_WORDS); i++) {
+        Py_ssize_t m = match_kw(p, end, PRE_WORDS[i].word);
+        if (m) {
+            *letter = PRE_WORDS[i].letter;
+            *mlen = m;
+            return 1;
+        }
     }
     return 0;
+}
+
+/* Normalized pre-release letters are exactly "a", "b" or "rc". */
+static int
+pre_letter_index(PyObject *letter)
+{
+    return PyUnicode_CompareWithASCIIString(letter, "a") == 0   ? PRE_A
+           : PyUnicode_CompareWithASCIIString(letter, "b") == 0 ? PRE_B
+                                                                : PRE_RC;
+}
+
+/* Local labels: [a-z0-9]+ ([.-_] [a-z0-9]+)*.  Returns the matched length. */
+static Py_ssize_t
+scan_local(const char *p, const char *end)
+{
+    const char *start = p;
+    int seg_chars = 0;
+    for (;;) {
+        if (p < end && Py_ISALNUM(*p)) {
+            seg_chars = 1;
+            p++;
+        }
+        else if (p < end && is_sep(*p) && seg_chars) {
+            seg_chars = 0;
+            p++;
+        }
+        else {
+            break;
+        }
+    }
+    return seg_chars ? p - start : -1;
 }
 
 /* returns 0 on success, -1 on invalid version */
@@ -617,21 +629,14 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
     const char *p = s;
     const char *end = s + n;
 
-    while (p < end && Py_UNICODE_ISSPACE((unsigned char)*p)) {
-        p++;
-    }
-    while (end > p && Py_UNICODE_ISSPACE((unsigned char)end[-1])) {
-        end--;
-    }
-
-    if (p < end && (lc(*p) == 'v')) {
+    if (p < end && Py_TOLOWER(*p) == 'v') {
         p++;
     }
 
     /* epoch vs first release segment: digits then '!' => epoch */
     {
         const char *d = p;
-        while (d < end && *d >= '0' && *d <= '9') {
+        while (d < end && Py_ISDIGIT(*d)) {
             d++;
         }
         if (d > p && d < end && *d == '!') {
@@ -644,7 +649,7 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
     }
 
     /* release: [0-9]+ (. [0-9]+)* */
-    if (!(p < end && *p >= '0' && *p <= '9')) {
+    if (!(p < end && Py_ISDIGIT(*p))) {
         return -1;
     }
     out->rel_span = p;
@@ -667,7 +672,7 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
         if (p < end && *p == '.') {
             /* lookahead: only consume '.' if a digit follows (else it may be
                a pre/post/dev separator) */
-            if (p + 1 < end && p[1] >= '0' && p[1] <= '9') {
+            if (p + 1 < end && Py_ISDIGIT(p[1])) {
                 p++;
                 continue;
             }
@@ -678,134 +683,68 @@ parse_version(const char *s, Py_ssize_t n, ParsedVersion *out)
 
     /* pre: [sep]? letter [sep]? [N]? */
     {
-        const char *save = p;
-        const char *q = p;
-        if (q < end && is_sep(*q)) {
-            q++;
-        }
+        const char *q = skip_sep(p, end);
         int letter;
-        Py_ssize_t mlen;
-        if (q < end && match_pre_letter(q, end, &letter, &mlen)) {
-            q += mlen;
-            if (q < end && is_sep(*q)) {
-                q++;
-            }
+        Py_ssize_t m;
+        if (q < end && match_pre_letter(q, end, &letter, &m)) {
+            q = skip_sep(q + m, end);
             NumberField f;
-            q += read_digits(q, end, &f);
+            p = q + read_digits(q, end, &f);
             out->has_pre = 1;
             out->pre_letter = letter;
-            out->pre_n = f; /* present flag inside */
-            if (!f.present) {
-                out->pre_n.val = 0;
-                out->pre_n.too_big = 0;
-            }
-            p = q;
-        }
-        else {
-            p = save;
+            out->pre_n = f;
         }
     }
 
     /* post: '-' N  |  [sep]? (post|rev|r) [sep]? [N]? */
-    {
-        const char *save = p;
-        if (p < end && *p == '-' && p + 1 < end && p[1] >= '0' &&
-            p[1] <= '9') {
-            p++;
+    if (p + 1 < end && *p == '-' && Py_ISDIGIT(p[1])) {
+        p++;
+        NumberField f;
+        p += read_digits(p, end, &f);
+        out->has_post = 1;
+        out->post_n = f;
+    }
+    else {
+        const char *q = skip_sep(p, end);
+        Py_ssize_t m = match_kw(q, end, "post");
+        if (!m) {
+            m = match_kw(q, end, "rev");
+        }
+        if (!m) {
+            m = match_kw(q, end, "r");
+        }
+        if (m) {
+            q = skip_sep(q + m, end);
             NumberField f;
-            p += read_digits(p, end, &f);
+            p = q + read_digits(q, end, &f);
             out->has_post = 1;
             out->post_n = f;
-        }
-        else {
-            const char *q = p;
-            if (q < end && is_sep(*q)) {
-                q++;
-            }
-            Py_ssize_t m;
-            Py_ssize_t klen = 0;
-            if ((m = match_kw(q, end, "post"))) {
-                klen = m;
-            }
-            else if ((m = match_kw(q, end, "rev"))) {
-                klen = m;
-            }
-            else if ((m = match_kw(q, end, "r"))) {
-                klen = m;
-            }
-            if (klen) {
-                q += klen;
-                if (q < end && is_sep(*q)) {
-                    q++;
-                }
-                NumberField f;
-                q += read_digits(q, end, &f);
-                out->has_post = 1;
-                if (!f.present) {
-                    f.val = 0;
-                    f.too_big = 0;
-                }
-                out->post_n = f;
-                p = q;
-            }
-            else {
-                p = save;
-            }
         }
     }
 
     /* dev: [sep]? dev [sep]? [N]? */
     {
-        const char *save = p;
-        const char *q = p;
-        if (q < end && is_sep(*q)) {
-            q++;
-        }
+        const char *q = skip_sep(p, end);
         Py_ssize_t m = match_kw(q, end, "dev");
         if (m) {
-            q += m;
-            if (q < end && is_sep(*q)) {
-                q++;
-            }
+            q = skip_sep(q + m, end);
             NumberField f;
-            q += read_digits(q, end, &f);
+            p = q + read_digits(q, end, &f);
             out->has_dev = 1;
-            if (!f.present) {
-                f.val = 0;
-                f.too_big = 0;
-            }
             out->dev_n = f;
-            p = q;
-        }
-        else {
-            p = save;
         }
     }
 
-    /* local: + [a-z0-9]+ ([sep][a-z0-9]+)* */
     if (p < end && *p == '+') {
         p++;
+        Py_ssize_t length = scan_local(p, end);
+        if (length < 0) {
+            return -1;
+        }
         out->has_local = 1;
         out->local_span = p;
-        int seg_chars = 0;
-        for (;;) {
-            if (p < end && ((lc(*p) >= 'a' && lc(*p) <= 'z') ||
-                            (*p >= '0' && *p <= '9'))) {
-                seg_chars = 1;
-                p++;
-            }
-            else if (p < end && is_sep(*p) && seg_chars > 0) {
-                seg_chars = 0;
-                p++;
-            }
-            else {
-                break;
-            }
-        }
-        if (seg_chars == 0) {
-            return -1; /* empty trailing segment or empty local */
-        }
-        out->local_span_len = p - out->local_span;
+        out->local_span_len = length;
+        p += length;
     }
 
     if (p != end) {
@@ -830,7 +769,7 @@ local_from_ascii(const char *text, Py_ssize_t length)
         Py_ssize_t end = start;
         int numeric = 1;
         while (end < length && !is_sep(text[end])) {
-            if (text[end] < '0' || text[end] > '9') {
+            if (!Py_ISDIGIT(text[end])) {
                 numeric = 0;
             }
             end++;
@@ -844,7 +783,7 @@ local_from_ascii(const char *text, Py_ssize_t length)
             if (part != NULL) {
                 Py_UCS1 *data = PyUnicode_1BYTE_DATA(part);
                 for (Py_ssize_t j = start; j < end; j++) {
-                    data[j - start] = (Py_UCS1)lc(text[j]);
+                    data[j - start] = (Py_UCS1)Py_TOLOWER(text[j]);
                 }
             }
         }
@@ -870,25 +809,7 @@ normalize_local(PyObject *value, PyTypeObject *type)
         if (text == NULL) {
             return NULL;
         }
-        int empty = 1;
-        Py_ssize_t i;
-        for (i = 0; i < length; i++) {
-            char c = text[i];
-            if (is_sep(c)) {
-                if (empty) {
-                    break;
-                }
-                empty = 1;
-            }
-            else if ((c >= '0' && c <= '9') ||
-                     (lc(c) >= 'a' && lc(c) <= 'z')) {
-                empty = 0;
-            }
-            else {
-                break;
-            }
-        }
-        if (i == length && !empty) {
+        if (scan_local(text, text + length) == length) {
             return local_from_ascii(text, length);
         }
     }
@@ -916,26 +837,22 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
     const char *cursor = parsed->rel_span;
     const char *end = cursor + parsed->rel_span_len;
     for (Py_ssize_t i = 0; i < parsed->rel_count; i++) {
-        const char *start = cursor;
-        while (cursor < end && *cursor >= '0' && *cursor <= '9') {
-            cursor++;
-        }
-        PyObject *part = long_from(start, cursor - start);
+        const char *dot = memchr(cursor, '.', end - cursor);
+        const char *stop = dot ? dot : end;
+        PyObject *part = long_from(cursor, stop - cursor);
         if (part == NULL) {
             tuple_builder_clear(&builder);
             return -1;
         }
         builder.items[i] = part;
-        if (cursor < end) {
-            cursor++;
-        }
+        cursor = stop + 1;
     }
     Py_SETREF(parts[PART_RELEASE], tuple_builder_finish(&builder));
     if (parts[PART_RELEASE] == NULL) {
         return -1;
     }
     if (parsed->has_pre) {
-        PyObject *number = parsed->pre_n.present
+        PyObject *number = parsed->pre_n.len
                                ? long_from(parsed->pre_n.s, parsed->pre_n.len)
                                : PyLong_FromLong(0);
         if (number == NULL) {
@@ -950,7 +867,7 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
     }
     if (parsed->has_post) {
         Py_SETREF(parts[PART_POST],
-                  parsed->post_n.present
+                  parsed->post_n.len
                       ? long_from(parsed->post_n.s, parsed->post_n.len)
                       : PyLong_FromLong(0));
         if (parts[PART_POST] == NULL) {
@@ -959,7 +876,7 @@ parts_from_parsed(const ParsedVersion *parsed, PyObject **parts)
     }
     if (parsed->has_dev) {
         Py_SETREF(parts[PART_DEV],
-                  parsed->dev_n.present
+                  parsed->dev_n.len
                       ? long_from(parsed->dev_n.s, parsed->dev_n.len)
                       : PyLong_FromLong(0));
         if (parts[PART_DEV] == NULL) {
@@ -984,27 +901,22 @@ parse_into_version(VersionObject *target, PyObject *original)
     if (!PyUnicode_Check(original)) {
         goto invalid;
     }
-    if (PyUnicode_IS_ASCII(original)) {
-        text = Py_NewRef(original);
+    Py_ssize_t start = 0;
+    Py_ssize_t end = PyUnicode_GET_LENGTH(original);
+    while (start < end &&
+           Py_UNICODE_ISSPACE(PyUnicode_READ_CHAR(original, start))) {
+        start++;
     }
-    else {
-        Py_ssize_t start = 0;
-        Py_ssize_t end = PyUnicode_GET_LENGTH(original);
-        while (start < end &&
-               Py_UNICODE_ISSPACE(PyUnicode_READ_CHAR(original, start))) {
-            start++;
-        }
-        while (end > start &&
-               Py_UNICODE_ISSPACE(PyUnicode_READ_CHAR(original, end - 1))) {
-            end--;
-        }
-        text = PyUnicode_Substring(original, start, end);
-        if (text == NULL) {
-            return -1;
-        }
-        if (!PyUnicode_IS_ASCII(text)) {
-            goto invalid;
-        }
+    while (end > start &&
+           Py_UNICODE_ISSPACE(PyUnicode_READ_CHAR(original, end - 1))) {
+        end--;
+    }
+    text = PyUnicode_Substring(original, start, end);
+    if (text == NULL) {
+        return -1;
+    }
+    if (!PyUnicode_IS_ASCII(text)) {
+        goto invalid;
     }
     Py_ssize_t length;
     const char *data = PyUnicode_AsUTF8AndSize(text, &length);
@@ -1032,7 +944,8 @@ parse_into_version(VersionObject *target, PyObject *original)
             .pre_n = parsed.has_pre ? (uint16_t)parsed.pre_n.val : 0,
             .post_n = parsed.has_post ? (uint16_t)parsed.post_n.val : 0,
             .dev_n = parsed.has_dev ? (uint16_t)parsed.dev_n.val : 0,
-            .flags = parsed.has_post | (parsed.has_dev << 1),
+            .flags = (parsed.has_post ? HAS_POST : 0) |
+                     (parsed.has_dev ? HAS_DEV : 0),
         };
         memcpy(parts.release, parsed.rel_small, sizeof(parts.release));
         value.key = pack_small_key(&parts);
@@ -1162,9 +1075,7 @@ version_setstate(PyObject *self, PyObject *state)
         }
         PyObject *parts[PART_COUNT] = {0};
         int result = parts_from_version(current, parts);
-        if (current != state) {
-            Py_DECREF(current);
-        }
+        release_current(state, current);
         PyObject *snapshot = result < 0 ? NULL
             : make_parts((PyTypeObject *)module_state->version_type, parts);
         clear_parts(parts);
@@ -1206,12 +1117,37 @@ version_init(PyObject *self, PyObject *args, PyObject *keywords)
         PyErr_SetString(PyExc_TypeError, "Version is already initialized");
         return -1;
     }
-    char *names[] = {"version", NULL};
+    static char *names[] = {"version", NULL};
     PyObject *text;
-    if (!PyArg_ParseTupleAndKeywords(args, keywords, "O:Version", names, &text)) {
+    if (!PyArg_ParseTupleAndKeywords(args, keywords, "O:Version", names,
+                                     &text)) {
         return -1;
     }
     return parse_into_version(version_cast(self), text);
+}
+
+/* Version(text) skips tuple packing and format parsing.  Other call shapes
+ * take tp_call, so version_init reports their errors.  Subclasses do not
+ * inherit this slot. */
+static PyObject *
+version_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf,
+                   PyObject *kwnames)
+{
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (nargs != 1 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0)) {
+        return _PyObject_MakeTpCall(_PyThreadState_GET(), type, args, nargs,
+                                    kwnames);
+    }
+    PyTypeObject *version_type = (PyTypeObject *)type;
+    PyObject *target = version_type->tp_alloc(version_type, 0);
+    if (target == NULL) {
+        return NULL;
+    }
+    if (parse_into_version(version_cast(target), args[0]) < 0) {
+        Py_DECREF(target);
+        return NULL;
+    }
+    return target;
 }
 
 static int
@@ -1325,46 +1261,6 @@ normalize_part(int index, PyObject *value, PyTypeObject *type)
 }
 
 static int
-parse_parts_arguments(PyObject *const *args, Py_ssize_t nargs,
-                      PyObject *kwnames, const char *method, PyObject **parts)
-{
-    if (nargs != 0) {
-        PyErr_Format(PyExc_TypeError, "%s() accepts keyword arguments only",
-                     method);
-        return -1;
-    }
-    Py_ssize_t count = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
-    for (Py_ssize_t i = 0; i < count; i++) {
-        PyObject *name = PyTuple_GET_ITEM(kwnames, i);
-        if (!PyUnicode_Check(name)) {
-            PyErr_Format(PyExc_TypeError, "%s() keywords must be strings",
-                         method);
-            return -1;
-        }
-        int index;
-        for (index = 0; index < PART_COUNT; index++) {
-            if (PyUnicode_CompareWithASCIIString(name, PART_NAMES[index]) ==
-                0) {
-                break;
-            }
-        }
-        if (index == PART_COUNT) {
-            PyErr_Format(PyExc_TypeError,
-                         "%s() got an unexpected keyword argument '%U'",
-                         method, name);
-            return -1;
-        }
-        if (parts[index]) {
-            PyErr_Format(PyExc_TypeError, "%s() got multiple values for '%U'",
-                         method, name);
-            return -1;
-        }
-        parts[index] = args[i];
-    }
-    return 0;
-}
-
-static int
 small_number(PyObject *value, uint16_t *result)
 {
     /* Preserve int subclasses in FULL, including their public representation.
@@ -1382,11 +1278,13 @@ small_number(PyObject *value, uint16_t *result)
     return 1;
 }
 
+/* Apply the given normalized parts to small; NULL parts keep their value.
+ * Return 0 if a part needs full storage. */
 static int
 apply_small_parts(SmallParts *small, PyObject *const *parts)
 {
     if (parts[PART_EPOCH] && (!PyLong_CheckExact(parts[PART_EPOCH]) ||
-                              PyObject_IsTrue(parts[PART_EPOCH]))) {
+                              !PyLong_IsZero(parts[PART_EPOCH]))) {
         return 0;
     }
     if (parts[PART_LOCAL] && parts[PART_LOCAL] != Py_None) {
@@ -1395,7 +1293,7 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
     if (parts[PART_RELEASE]) {
         PyObject *release = parts[PART_RELEASE];
         Py_ssize_t count = PyTuple_GET_SIZE(release);
-        if (!PyTuple_CheckExact(release) || count > 4) {
+        if (count > 4) {
             return 0;
         }
         small->release_count = (uint8_t)count;
@@ -1414,18 +1312,14 @@ apply_small_parts(SmallParts *small, PyObject *const *parts)
             if (!small_number(PyTuple_GET_ITEM(pre, 1), &small->pre_n)) {
                 return 0;
             }
-            PyObject *letter = PyTuple_GET_ITEM(pre, 0);
-            small->pre_letter =
-                PyUnicode_CompareWithASCIIString(letter, "a") == 0   ? PRE_A
-                : PyUnicode_CompareWithASCIIString(letter, "b") == 0 ? PRE_B
-                                                                     : PRE_RC;
+            small->pre_letter = pre_letter_index(PyTuple_GET_ITEM(pre, 0));
         }
     }
     for (int index = PART_POST; index <= PART_DEV; index++) {
         if (!parts[index]) {
             continue;
         }
-        int flag = index == PART_POST ? 1 : 2;
+        int flag = index == PART_POST ? HAS_POST : HAS_DEV;
         uint16_t *number = index == PART_POST ? &small->post_n : &small->dev_n;
         *number = 0;
         small->flags &= ~flag;
@@ -1449,35 +1343,38 @@ make_parts(PyTypeObject *type, PyObject *const *parts)
     return make_full_parts(type, parts);
 }
 
+/*[clinic input]
+@classmethod
+_version.Version.from_parts
+
+    *
+    release: object
+    epoch: object(c_default="Py_None") = 0
+    pre: object = None
+    post: object = None
+    dev: object = None
+    local: object = None
+
+Build a version directly from validated components.
+[clinic start generated code]*/
+
 static PyObject *
-version_from_parts(PyObject *type, PyObject *const *args, Py_ssize_t nargs,
-                   PyObject *kwnames)
+_version_Version_from_parts_impl(PyTypeObject *type, PyObject *release,
+                                 PyObject *epoch, PyObject *pre,
+                                 PyObject *post, PyObject *dev,
+                                 PyObject *local)
+/*[clinic end generated code: output=219df961e7e8b0ce input=895d328e910ba492]*/
 {
-    PyObject *arguments[PART_COUNT] = {0};
-    if (parse_parts_arguments(args, nargs, kwnames, "from_parts", arguments) <
-        0) {
-        return NULL;
-    }
-    if (!arguments[PART_RELEASE]) {
-        PyErr_SetString(
-            PyExc_TypeError,
-            "from_parts() missing required keyword argument: 'release'");
-        return NULL;
-    }
-    VersionState *st = state_from_type((PyTypeObject *)type);
-    if (st == NULL) {
-        return NULL;
-    }
+    PyObject *arguments[PART_COUNT] = {epoch, release, pre, post, dev, local};
     PyObject *parts[PART_COUNT] = {0};
     for (int i = 0; i < PART_COUNT; i++) {
-        parts[i] =
-            normalize_part(i, arguments[i] ? arguments[i] : Py_None, (PyTypeObject *)type);
+        parts[i] = normalize_part(i, arguments[i], type);
         if (!parts[i]) {
             clear_parts(parts);
             return NULL;
         }
     }
-    PyObject *result = make_parts((PyTypeObject *)type, parts);
+    PyObject *result = make_parts(type, parts);
     clear_parts(parts);
     return result;
 }
@@ -1499,19 +1396,17 @@ get_release_impl(PyObject *self, void *Py_UNUSED(context))
     if (!is_small(version)) {
         return Py_NewRef(version->value.full->parts[PART_RELEASE]);
     }
+    SmallParts parts = unpack_small(version);
     TupleBuilder builder;
-    if (tuple_builder_init(&builder, version->release_len) < 0) {
+    if (tuple_builder_init(&builder, parts.release_count) < 0) {
         return NULL;
     }
-    uint64_t packed = small_release(version);
-    for (int i = 0; i < version->release_len; i++) {
-        PyObject *part =
-            PyLong_FromUnsignedLong((packed >> (48 - 16 * i)) & UINT16_MAX);
-        if (part == NULL) {
+    for (int i = 0; i < parts.release_count; i++) {
+        builder.items[i] = PyLong_FromLong(parts.release[i]);
+        if (builder.items[i] == NULL) {
             tuple_builder_clear(&builder);
             return NULL;
         }
-        builder.items[i] = part;
     }
     return tuple_builder_finish(&builder);
 }
@@ -1523,11 +1418,12 @@ get_pre_impl(PyObject *self, void *Py_UNUSED(context))
     if (!is_small(version)) {
         return Py_NewRef(version->value.full->parts[PART_PRE]);
     }
-    uint32_t pre = small_pre(version);
-    if ((pre >> 18) != 1) {
+    SmallParts parts = unpack_small(version);
+    if (parts.pre_letter == PRE_NONE) {
         Py_RETURN_NONE;
     }
-    return Py_BuildValue("(sI)", PRE_NAMES[(pre >> 16) & 3], pre & UINT16_MAX);
+    return Py_BuildValue("(sI)", PRE_NAMES[parts.pre_letter],
+                         (unsigned int)parts.pre_n);
 }
 
 static PyObject *
@@ -1537,11 +1433,11 @@ get_post_impl(PyObject *self, void *Py_UNUSED(context))
     if (!is_small(version)) {
         return Py_NewRef(version->value.full->parts[PART_POST]);
     }
-    uint32_t post = small_post(version);
-    if (!(post >> 16)) {
+    SmallParts parts = unpack_small(version);
+    if (!(parts.flags & HAS_POST)) {
         Py_RETURN_NONE;
     }
-    return PyLong_FromUnsignedLong(post & UINT16_MAX);
+    return PyLong_FromLong(parts.post_n);
 }
 
 static PyObject *
@@ -1551,11 +1447,11 @@ get_dev_impl(PyObject *self, void *Py_UNUSED(context))
     if (!is_small(version)) {
         return Py_NewRef(version->value.full->parts[PART_DEV]);
     }
-    uint32_t dev = small_dev(version);
-    if (dev == 0x1ffff) {
+    SmallParts parts = unpack_small(version);
+    if (!(parts.flags & HAS_DEV)) {
         Py_RETURN_NONE;
     }
-    return PyLong_FromUnsignedLong(dev);
+    return PyLong_FromLong(parts.dev_n);
 }
 
 static int
@@ -1599,8 +1495,9 @@ get_is_prerelease_impl(PyObject *self, void *Py_UNUSED(context))
 {
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
-        return PyBool_FromLong((small_pre(version) >> 18) == 1 ||
-                               small_dev(version) != 0x1ffff);
+        SmallParts parts = unpack_small(version);
+        return PyBool_FromLong(parts.pre_letter != PRE_NONE ||
+                               (parts.flags & HAS_DEV));
     }
     PyObject **parts = version->value.full->parts;
     return PyBool_FromLong(parts[PART_PRE] != Py_None ||
@@ -1612,7 +1509,7 @@ get_is_postrelease_impl(PyObject *self, void *Py_UNUSED(context))
 {
     VersionObject *version = version_cast(self);
     return PyBool_FromLong(
-        is_small(version) ? small_post(version) >> 16
+        is_small(version) ? unpack_small(version).flags & HAS_POST
                           : version->value.full->parts[PART_POST] != Py_None);
 }
 
@@ -1621,7 +1518,7 @@ get_is_devrelease_impl(PyObject *self, void *Py_UNUSED(context))
 {
     VersionObject *version = version_cast(self);
     return PyBool_FromLong(
-        is_small(version) ? small_dev(version) != 0x1ffff
+        is_small(version) ? unpack_small(version).flags & HAS_DEV
                           : version->value.full->parts[PART_DEV] != Py_None);
 }
 
@@ -1630,11 +1527,9 @@ release_item(PyObject *self, Py_ssize_t index)
 {
     VersionObject *version = version_cast(self);
     if (is_small(version)) {
-        if (index >= version->release_len) {
-            return PyLong_FromLong(0);
-        }
-        return PyLong_FromUnsignedLong(
-            (small_release(version) >> (48 - 16 * index)) & UINT16_MAX);
+        SmallParts parts = unpack_small(version);
+        return PyLong_FromLong(
+            index < parts.release_count ? parts.release[index] : 0);
     }
     PyObject *release = version->value.full->parts[PART_RELEASE];
     if (index >= PyTuple_GET_SIZE(release)) {
@@ -1705,11 +1600,11 @@ format_small_version(const VersionObject *version, int mode)
             }
             output = write_small_number(output, parts.pre_n);
         }
-        if (parts.flags & 1) {
+        if (parts.flags & HAS_POST) {
             memcpy(output, ".post", 5);
             output = write_small_number(output + 5, parts.post_n);
         }
-        if (parts.flags & 2) {
+        if (parts.flags & HAS_DEV) {
             memcpy(output, ".dev", 4);
             output = write_small_number(output + 4, parts.dev_n);
         }
@@ -1843,9 +1738,7 @@ version_parts_dict(PyObject *self)
             Py_SETREF(parts[PART_LOCAL], local);
         }
     }
-    if (current != self) {
-        Py_DECREF(current);
-    }
+    release_current(self, current);
     if (status < 0) {
         clear_parts(parts);
         return NULL;
@@ -1870,18 +1763,14 @@ version_reduce(PyObject *self, PyObject *Py_UNUSED(ignored))
     if (parts == NULL) {
         return NULL;
     }
-    PyObject *factory = NULL, *module = NULL, *partial = NULL;
+    PyObject *factory = NULL, *partial = NULL;
     PyObject *arguments = NULL, *constructor = NULL, *state = NULL;
     PyObject *empty = NULL, *result = NULL;
     factory = PyObject_GetAttrString((PyObject *)Py_TYPE(self), "from_parts");
     if (factory == NULL) {
         goto done;
     }
-    module = PyImport_ImportModule("functools");
-    if (module == NULL) {
-        goto done;
-    }
-    partial = PyObject_GetAttrString(module, "partial");
+    partial = PyImport_ImportModuleAttrString("functools", "partial");
     if (partial == NULL) {
         goto done;
     }
@@ -1905,7 +1794,6 @@ version_reduce(PyObject *self, PyObject *Py_UNUSED(ignored))
 done:
     Py_DECREF(parts);
     Py_XDECREF(factory);
-    Py_XDECREF(module);
     Py_XDECREF(partial);
     Py_XDECREF(arguments);
     Py_XDECREF(constructor);
@@ -1936,23 +1824,11 @@ parts_from_version(PyObject *self, PyObject **parts)
     return 0;
 }
 
+/* arguments holds the new components; NULL keeps the current one. */
 static PyObject *
-version_replace_impl(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
-                     PyObject *kwnames, PyTypeObject *result_type)
+replace_parts(PyObject *self, PyObject *const *arguments,
+              PyTypeObject *result_type)
 {
-    PyObject *arguments[PART_COUNT] = {0};
-    if (parse_parts_arguments(args, nargs, kwnames, "__replace__", arguments) <
-        0) {
-        return NULL;
-    }
-    if (!kwnames || !PyTuple_GET_SIZE(kwnames)) {
-        return Py_NewRef(self);
-    }
-
-    VersionState *st = state_from_type(result_type);
-    if (st == NULL) {
-        return NULL;
-    }
     PyObject *parts[PART_COUNT] = {0};
     for (int i = 0; i < PART_COUNT; i++) {
         if (arguments[i]) {
@@ -2009,23 +1885,38 @@ version_replace_impl(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     return result;
 }
 
-/* Preserve the original subtype when replacing an immutable snapshot. */
+/*[clinic input]
+_version.Version.__replace__
+
+    *
+    epoch: object(c_default="NULL", py_default="...") = None
+    release: object(c_default="NULL", py_default="...") = None
+    pre: object(c_default="NULL", py_default="...") = None
+    post: object(c_default="NULL", py_default="...") = None
+    dev: object(c_default="NULL", py_default="...") = None
+    local: object(c_default="NULL", py_default="...") = None
+
+Replace components; omitted components retain their values.
+[clinic start generated code]*/
+
 static PyObject *
-version_replace(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
-                PyObject *kwnames)
+_version_Version___replace___impl(PyObject *self, PyObject *epoch,
+                                  PyObject *release, PyObject *pre,
+                                  PyObject *post, PyObject *dev,
+                                  PyObject *local)
+/*[clinic end generated code: output=f97988a570b681ba input=6fedfeba7daeb96e]*/
 {
+    PyObject *arguments[PART_COUNT] = {epoch, release, pre, post, dev, local};
     PyObject *current = version_current(self);
     if (current == NULL) {
         return NULL;
     }
-    PyObject *result = version_replace_impl(current, args, nargs, kwnames,
-                                            Py_TYPE(self));
-    if (current != self) {
-        if (result == current) {
-            Py_SETREF(result, Py_NewRef(self));
-        }
-        Py_DECREF(current);
+    /* Keep the original subtype when replacing an immutable snapshot. */
+    PyObject *result = replace_parts(current, arguments, Py_TYPE(self));
+    if (result == current && current != self) {
+        Py_SETREF(result, Py_NewRef(self));
     }
+    release_current(self, current);
     return result;
 }
 
@@ -2078,10 +1969,7 @@ build_cmpkey(PyTypeObject *type, PyObject *const *parts)
             pre_number = zero;
         }
         else {
-            PyObject *letter = PyTuple_GET_ITEM(pre, 0);
-            rank = PyUnicode_CompareWithASCIIString(letter, "a") == 0   ? 0
-                   : PyUnicode_CompareWithASCIIString(letter, "b") == 0 ? 1
-                                                                        : 2;
+            rank = pre_letter_index(PyTuple_GET_ITEM(pre, 0));
             pre_number = PyTuple_GET_ITEM(pre, 1);
         }
         suffix = Py_BuildValue("(iOiOiO)", rank, pre_number, post != Py_None,
@@ -2166,27 +2054,6 @@ get_cmpkey(PyObject *self)
 }
 
 static PyObject *
-cmp_to_bool(int comparison, int op)
-{
-    switch (op) {
-    case Py_LT:
-        return PyBool_FromLong(comparison < 0);
-    case Py_LE:
-        return PyBool_FromLong(comparison <= 0);
-    case Py_EQ:
-        return PyBool_FromLong(comparison == 0);
-    case Py_NE:
-        return PyBool_FromLong(comparison != 0);
-    case Py_GT:
-        return PyBool_FromLong(comparison > 0);
-    case Py_GE:
-        return PyBool_FromLong(comparison >= 0);
-    default:
-        Py_RETURN_NOTIMPLEMENTED;
-    }
-}
-
-static PyObject *
 compare_current_versions(PyObject *self, PyObject *other, int op)
 {
     VersionObject *left = version_cast(self);
@@ -2199,7 +2066,7 @@ compare_current_versions(PyObject *self, PyObject *other, int op)
                          : a.low < b.low   ? -1
                          : a.low > b.low   ? 1
                                            : 0;
-        return cmp_to_bool(comparison, op);
+        Py_RETURN_RICHCOMPARE(comparison, 0, op);
     }
     PyObject *a = get_cmpkey(self);
     if (a == NULL) {
@@ -2234,11 +2101,9 @@ version_richcompare(PyObject *self, PyObject *other, int op)
     }
     PyObject *right = self == other ? left : version_current(other);
     PyObject *result = right == NULL ? NULL : compare_current_versions(left, right, op);
-    if (left != self) {
-        Py_DECREF(left);
-    }
-    if (other != self && right != NULL && right != other) {
-        Py_DECREF(right);
+    release_current(self, left);
+    if (other != self && right != NULL) {
+        release_current(other, right);
     }
     return result;
 }
@@ -2266,117 +2131,30 @@ version_hash(PyObject *self)
     return expected == -1 ? hash : expected;
 }
 
-static PyObject *
-get_epoch(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_epoch_impl(current, context), NULL);
-    return get_epoch_impl(self, context);
-}
+/* Each public getter reads the active snapshot, then calls its _impl. */
+#define DELEGATING_GETTER(name) \
+    static PyObject * \
+    get_##name(PyObject *self, void *context) \
+    { \
+        DELEGATE_VERSION(self, PyObject *, get_##name##_impl(current, context), \
+                         NULL); \
+        return get_##name##_impl(self, context); \
+    }
 
-static PyObject *
-get_release(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_release_impl(current, context), NULL);
-    return get_release_impl(self, context);
-}
-
-static PyObject *
-get_pre(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_pre_impl(current, context), NULL);
-    return get_pre_impl(self, context);
-}
-
-static PyObject *
-get_post(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_post_impl(current, context), NULL);
-    return get_post_impl(self, context);
-}
-
-static PyObject *
-get_dev(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_dev_impl(current, context), NULL);
-    return get_dev_impl(self, context);
-}
-
-static PyObject *
-get_local(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_local_impl(current, context), NULL);
-    return get_local_impl(self, context);
-}
-
-static PyObject *
-get_is_prerelease(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_is_prerelease_impl(current, context), NULL);
-    return get_is_prerelease_impl(self, context);
-}
-
-static PyObject *
-get_is_postrelease(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_is_postrelease_impl(current, context), NULL);
-    return get_is_postrelease_impl(self, context);
-}
-
-static PyObject *
-get_is_devrelease(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_is_devrelease_impl(current, context), NULL);
-    return get_is_devrelease_impl(self, context);
-}
-
-static PyObject *
-get_major(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_major_impl(current, context), NULL);
-    return get_major_impl(self, context);
-}
-
-static PyObject *
-get_minor(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_minor_impl(current, context), NULL);
-    return get_minor_impl(self, context);
-}
-
-static PyObject *
-get_micro(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_micro_impl(current, context), NULL);
-    return get_micro_impl(self, context);
-}
-
-static PyObject *
-get_base_version(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_base_version_impl(current, context), NULL);
-    return get_base_version_impl(self, context);
-}
-
-static PyObject *
-get_public(PyObject *self, void *context)
-{
-    DELEGATE_VERSION(self, PyObject *, get_public_impl(current, context), NULL);
-    return get_public_impl(self, context);
-}
-
-PyDoc_STRVAR(
-    from_parts_doc,
-    "from_parts($type, /, *, epoch=0, release, pre=None, post=None, dev=None, "
-    "local=None)\n"
-    "--\n\n"
-    "Build a version directly from validated components.");
-
-PyDoc_STRVAR(
-    replace_doc,
-    "__replace__($self, /, *, epoch=..., release=..., pre=..., post=..., "
-    "dev=..., local=...)\n"
-    "--\n\n"
-    "Replace components; omitted components retain their values.");
+DELEGATING_GETTER(epoch)
+DELEGATING_GETTER(release)
+DELEGATING_GETTER(pre)
+DELEGATING_GETTER(post)
+DELEGATING_GETTER(dev)
+DELEGATING_GETTER(local)
+DELEGATING_GETTER(is_prerelease)
+DELEGATING_GETTER(is_postrelease)
+DELEGATING_GETTER(is_devrelease)
+DELEGATING_GETTER(major)
+DELEGATING_GETTER(minor)
+DELEGATING_GETTER(micro)
+DELEGATING_GETTER(base_version)
+DELEGATING_GETTER(public)
 
 PyDoc_STRVAR(
     sizeof_doc,
@@ -2390,32 +2168,45 @@ PyDoc_STRVAR(reduce_doc,
              "Return constructor arguments and subclass state for pickling.");
 
 static PyMethodDef version_methods[] = {
-    {"from_parts", (PyCFunction)(void (*)(void))version_from_parts,
-     METH_FASTCALL | METH_KEYWORDS | METH_CLASS, from_parts_doc},
-    {"__replace__", (PyCFunction)(void (*)(void))version_replace,
-     METH_FASTCALL | METH_KEYWORDS, replace_doc},
+    _VERSION_VERSION_FROM_PARTS_METHODDEF
+    _VERSION_VERSION___REPLACE___METHODDEF
     {"__sizeof__", version_sizeof, METH_NOARGS, sizeof_doc},
     {"__reduce__", version_reduce, METH_NOARGS, reduce_doc},
     {"__setstate__", version_setstate, METH_O,
+     "__setstate__($self, state, /)\n"
+     "--\n\n"
      "Restore an empty value or subclass attributes."},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef version_getset[] = {
-    {"epoch", get_epoch, NULL, NULL, NULL},
-    {"release", get_release, NULL, NULL, NULL},
-    {"pre", get_pre, NULL, NULL, NULL},
-    {"post", get_post, NULL, NULL, NULL},
-    {"dev", get_dev, NULL, NULL, NULL},
-    {"local", get_local, NULL, NULL, NULL},
-    {"is_prerelease", get_is_prerelease, NULL, NULL, NULL},
-    {"is_postrelease", get_is_postrelease, NULL, NULL, NULL},
-    {"is_devrelease", get_is_devrelease, NULL, NULL, NULL},
-    {"major", get_major, NULL, NULL, NULL},
-    {"minor", get_minor, NULL, NULL, NULL},
-    {"micro", get_micro, NULL, NULL, NULL},
-    {"base_version", get_base_version, NULL, NULL, NULL},
-    {"public", get_public, NULL, NULL, NULL},
+    {"epoch", get_epoch, NULL,
+     "The epoch as an integer; zero when omitted.", NULL},
+    {"release", get_release, NULL,
+     "The release as a tuple of integers, including trailing zeros.", NULL},
+    {"pre", get_pre, NULL,
+     "A pair of 'a', 'b' or 'rc' and an integer, or None.", NULL},
+    {"post", get_post, NULL, "The post-release number, or None.", NULL},
+    {"dev", get_dev, NULL, "The development-release number, or None.", NULL},
+    {"local", get_local, NULL,
+     "The normalized local label as a string, or None.", NULL},
+    {"is_prerelease", get_is_prerelease, NULL,
+     "Whether the version has a pre-release or development-release component.",
+     NULL},
+    {"is_postrelease", get_is_postrelease, NULL,
+     "Whether the version has a post-release component.", NULL},
+    {"is_devrelease", get_is_devrelease, NULL,
+     "Whether the version has a development-release component.", NULL},
+    {"major", get_major, NULL,
+     "The first release integer.", NULL},
+    {"minor", get_minor, NULL,
+     "The second release integer; zero when omitted.", NULL},
+    {"micro", get_micro, NULL,
+     "The third release integer; zero when omitted.", NULL},
+    {"base_version", get_base_version, NULL,
+     "The epoch and release as a string.", NULL},
+    {"public", get_public, NULL,
+     "The normalized version string without its local label.", NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
@@ -2442,9 +2233,7 @@ version_clear(PyObject *self)
     if (!is_small(version) && version->value.full != NULL) {
         VersionFull *full = version->value.full;
         version->value.full = NULL;
-        clear_parts(full->parts);
-        Py_XDECREF(full->key);
-        PyMem_Free(full);
+        free_full(full);
     }
     return 0;
 }
@@ -2466,6 +2255,7 @@ PyDoc_STRVAR(version_doc, "Version(version)\n"
 static PyType_Slot version_slots[] = {
     {Py_tp_doc, (void *)version_doc},
     {Py_tp_init, version_init},
+    {Py_tp_vectorcall, version_vectorcall},
     {Py_tp_dealloc, version_dealloc},
     {Py_tp_traverse, version_traverse},
     {Py_tp_richcompare, version_richcompare},
